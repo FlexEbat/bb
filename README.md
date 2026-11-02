@@ -2,7 +2,7 @@
 
 A lightweight, CLI-only tool that blocks BitTorrent, DHT and blocklisted IP ranges on a Linux host or gateway. Blocking happens in the kernel, so the CPU cost is close to zero. No web panel, no database, no heavy IDS.
 
-> **Status:** under development. See [`tech.md`](tech.md) for the full specification.
+> **Status:** under development. 
 
 ## Features
 
