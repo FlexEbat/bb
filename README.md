@@ -3,6 +3,16 @@
 A lightweight, CLI-only tool that blocks BitTorrent, DHT and blocklisted IP ranges on a Linux host or gateway. Blocking happens in the kernel, so the CPU cost is close to zero. No web panel, no database, no heavy IDS.
 
 > **Status:** under development. See [`tech.md`](tech.md) for the full specification.
+>
+> Implemented so far (development order, section 17 of the spec): **step 1 core**
+> (backend abstraction for iptables+ipset and nft, sets and rules, `ban`/`unban`/`allow`,
+> `mode` with confirmation rollback, `apply`, `guard`, locking, EN/RU catalogs with parity
+> and lint checks), **step 2 static lists** (https-only download, strict validation,
+> private-range sanitizing, atomic replacement, shrink/empty protection, sha256) and
+> **step 3 DHT nodes**. Not yet: `bb install`/`uninstall`, systemd units and timers,
+> notifications, integrations, `bb doctor`, nDPId/listener, `--json`.
+> Until `bb install` exists, `make install` copies the files and `bb apply` needs a `bb.conf`
+> (see Development).
 
 ## Features
 
@@ -89,3 +99,19 @@ sudo bb uninstall
 ```
 
 Removes only `bb`'s own chain/table, sets and units. It never flushes the whole ruleset.
+
+## Development
+
+```sh
+sudo make test        # shellcheck + catalog lint + bats suite (needs root, uses network namespaces)
+```
+
+The suite runs in a private network and mount namespace and exercises both backends with
+real traffic over a veth pair (manual bans, allowlist precedence, lists, DHT port modes,
+dynamic flows, guard recovery, coexistence with foreign rules). Dependencies: `bats`,
+`shellcheck`, `nft`, `iptables`, `ipset`, `iproute2`, `ping`, `nc`.
+
+List sources may contain IPs, CIDRs, host names and tracker URLs
+(`udp://host:port/announce`); the host part is extracted and resolved.
+Entries broader than /8 (IPv4) or /16 (IPv6) are rejected so that a bad list cannot
+block everything.

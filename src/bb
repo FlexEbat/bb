@@ -1,0 +1,1427 @@
+#!/usr/bin/env bash
+# bb - lightweight CLI blocker for BitTorrent, DHT and blocklists.
+# Specification: tech.md. One bash script, no interpreters, no databases.
+#
+# Layout of this file:
+#   1. paths, i18n, output helpers
+#   2. utilities (durations, ports, entry normalization), config
+#   3. firewall abstraction layer + backends (iptables/ipset, nft)
+#   4. data sources: allowlist, manual bans, lists, DHT nodes
+#   5. commands and dispatcher
+
+set -uo pipefail
+umask 077
+shopt -s extglob
+
+BB_VERSION="0.1.0-dev"
+
+# ---------------------------------------------------------------------------
+# 1. Paths, i18n, output
+# ---------------------------------------------------------------------------
+if [[ ${BB_TESTING:-} == 1 ]]; then
+	# Test harness only: lets the suite run against a scratch root.
+	CONF_DIR=${BB_CONF_DIR:?}
+	STATE_DIR=${BB_STATE_DIR:?}
+	SHARE_DIR=${BB_SHARE_DIR:?}
+	BACKUP_DIR=${BB_BACKUP_DIR:?}
+	LOCK_FILE=${BB_LOCK_FILE:?}
+else
+	CONF_DIR=/etc/bb
+	STATE_DIR=/var/lib/bb
+	SHARE_DIR=/usr/share/bb
+	BACKUP_DIR=/var/backups/bb
+	LOCK_FILE=/run/bb.lock
+fi
+CONF_FILE=$CONF_DIR/bb.conf
+ALLOW_FILE=$CONF_DIR/allow.list
+MANUAL_FILE=$CONF_DIR/manual.list
+LISTS_D=$CONF_DIR/lists.d
+DHT_NODES_FILE=$CONF_DIR/dht.nodes
+CACHE_DIR=$STATE_DIR/lists
+DHT_CACHE=$STATE_DIR/dht.list
+AWK_NET=$SHARE_DIR/net.awk
+SELF=$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")
+
+# Entries broader than this are never accepted (a /0 would block everything).
+MIN_PREFIX4=8
+MIN_PREFIX6=16
+
+declare -A MSG=()
+LANG_NOW=en
+TMPD=""
+
+# printf-style catalog lookup. A key missing everywhere prints the key itself.
+t() {
+	local key=$1
+	shift
+	local fmt=${MSG[$key]-$key}
+	# shellcheck disable=SC2059
+	printf -- "$fmt" "$@"
+}
+
+say() { t "$@"; printf '\n'; }
+warn() { { t label_warning; printf ': '; t "$@"; printf '\n'; } >&2; }
+err() { { t label_error; printf ': '; t "$@"; printf '\n'; } >&2; }
+die() { err "$@"; exit 1; }
+# Plain English, used only before a catalog is loaded or when Russian cannot be shown.
+raw_warn() { printf 'bb: warning: %s\n' "$*" >&2; } # bb-lint: ok
+
+i18n_load() {
+	local lang=$1
+	MSG=()
+	# shellcheck disable=SC1091
+	source "$SHARE_DIR/lang/en.sh" || { printf 'bb: cannot load message catalog\n' >&2; exit 1; } # bb-lint: ok
+	if [[ $lang != en && -r $SHARE_DIR/lang/$lang.sh ]]; then
+		# shellcheck disable=SC1090
+		source "$SHARE_DIR/lang/$lang.sh"
+	fi
+	# shellcheck disable=SC2034
+	LANG_NOW=$lang
+}
+
+locale_is_utf8() {
+	case ${LC_ALL:-${LC_CTYPE:-${LANG:-}}} in
+		*[Uu][Tt][Ff]-8* | *[Uu][Tt][Ff]8*) return 0 ;;
+	esac
+	return 1
+}
+
+log_event() { # stable English event tags for journald: log_event tag [k=v ...]
+	command -v logger >/dev/null 2>&1 || return 0
+	logger -t bb -- "$*" 2>/dev/null || true
+}
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+cleanup() {
+	[[ -n $TMPD && -d $TMPD ]] && rm -rf -- "$TMPD"
+	return 0
+}
+trap cleanup EXIT
+
+mk_tmpdir() {
+	[[ -n $TMPD ]] && return 0
+	mkdir -p -- "$STATE_DIR" || die err_mkdir "$STATE_DIR"
+	TMPD=$(mktemp -d "$STATE_DIR/tmp.XXXXXX") || die err_mkdir "$STATE_DIR"
+}
+
+# ---------------------------------------------------------------------------
+# 2. Utilities
+# ---------------------------------------------------------------------------
+# dur2sec 7d -> 604800. Accepts N, Ns, Nm, Nh, Nd, Nw. Range 1..4294967 (ipset limit).
+dur2sec() {
+	local s=$1 n u
+	[[ $s =~ ^([0-9]{1,9})([smhdw]?)$ ]] || return 1
+	n=$((10#${BASH_REMATCH[1]}))
+	u=${BASH_REMATCH[2]}
+	case $u in
+		m) n=$((n * 60)) ;;
+		h) n=$((n * 3600)) ;;
+		d) n=$((n * 86400)) ;;
+		w) n=$((n * 604800)) ;;
+	esac
+	((n >= 1 && n <= 4294967)) || return 1
+	printf '%d\n' "$n"
+}
+
+is_uint() { [[ $1 =~ ^[0-9]{1,12}$ ]]; }
+
+# Port list "6881-6889,51413": numbers 1-65535, ranges ascending,
+# at most 15 multiport slots (a range takes two).
+ports_valid() {
+	local list=$1 item a b slots=0
+	[[ -n $list ]] || return 1
+	local IFS=,
+	for item in $list; do
+		if [[ $item =~ ^([0-9]{1,5})-([0-9]{1,5})$ ]]; then
+			a=$((10#${BASH_REMATCH[1]})) b=$((10#${BASH_REMATCH[2]}))
+			((a >= 1 && b <= 65535 && a < b)) || return 1
+			slots=$((slots + 2))
+		elif [[ $item =~ ^[0-9]{1,5}$ ]]; then
+			a=$((10#$item))
+			((a >= 1 && a <= 65535)) || return 1
+			slots=$((slots + 1))
+		else
+			return 1
+		fi
+	done
+	((slots <= 15))
+}
+
+# Normalize one user-supplied IP or CIDR. Prints "<4|6><TAB><canonical>".
+norm_entry() {
+	local out
+	[[ $1 =~ ^[0-9A-Fa-f:./]+$ ]] || return 1
+	out=$(printf '%s\n' "$1" | awk -v strip=0 -v minp4=$MIN_PREFIX4 -v minp6=$MIN_PREFIX6 -v hosts=0 -f "$AWK_NET") || return 1
+	[[ $out == [46]$'\t'* && $out != *$'\n'* ]] || return 1
+	printf '%s\n' "$out"
+}
+
+# ---- configuration --------------------------------------------------------
+declare -A CFG=()
+CFG_LOADED=0
+
+cfg_defaults() {
+	CFG=(
+		[lang]=en [backend]='' [install_backend]=nft [mode]=monitor
+		[ipv6]=yes [hook_priority]=-310 [list_maxelem]=1048576
+		[flow_ttl]=24h [flow_maxelem]=262144 [flow_dedup]=600
+		[max_event_size]=1048576 [min_list_ratio]=50 [strip_private]=yes
+		[integrations]=auto [guard_interval]=300 [confirm_timeout]=60
+		[flow_rate_limit]=1000 [iface]='' [ports_mode]=all [ports]=''
+		[list_max_size]=268435456 [resolve_max]=5000
+	)
+}
+
+cfg_valid() { # key value
+	local k=$1 v=$2
+	case $k in
+		lang) [[ $v == en || $v == ru ]] ;;
+		backend) [[ -z $v || $v == iptables || $v == nft ]] ;;
+		install_backend) [[ $v == iptables || $v == nft ]] ;;
+		mode) [[ $v == monitor || $v == block ]] ;;
+		ipv6 | strip_private) [[ $v == yes || $v == no ]] ;;
+		hook_priority) [[ $v =~ ^-?[0-9]{1,5}$ ]] ;;
+		list_maxelem | flow_maxelem | flow_dedup | max_event_size | confirm_timeout | flow_rate_limit | list_max_size | resolve_max)
+			is_uint "$v" && ((v >= 1)) ;;
+		flow_ttl | guard_interval) dur2sec "$v" >/dev/null ;;
+		min_list_ratio) is_uint "$v" && ((v <= 100)) ;;
+		integrations) [[ $v =~ ^[a-z0-9,]{1,64}$ ]] ;;
+		iface) [[ -z $v || $v =~ ^[A-Za-z0-9_.:@-]{1,64}$ ]] ;;
+		ports_mode) [[ $v == only || $v == all || $v == except ]] ;;
+		ports) [[ -z $v ]] || ports_valid "$v" ;;
+		*) return 1 ;;
+	esac
+}
+
+# Strict KEY='value' parser; the file is never sourced.
+cfg_load() {
+	cfg_defaults
+	CFG_LOADED=0
+	[[ -r $CONF_FILE ]] || return 1
+	local line k v n=0
+	while IFS= read -r line || [[ -n $line ]]; do
+		n=$((n + 1))
+		[[ $line =~ ^[[:space:]]*(#.*)?$ ]] && continue
+		if [[ $line =~ ^([a-z_][a-z0-9_]*)=\'([^\']*)\'$ ]]; then
+			k=${BASH_REMATCH[1]} v=${BASH_REMATCH[2]}
+			[[ -v CFG[$k] ]] || continue # unknown keys belong to other components
+			if cfg_valid "$k" "$v"; then CFG[$k]=$v; else warn warn_cfg_value "$k" "$n"; fi
+		else
+			warn warn_cfg_line "$n"
+		fi
+	done <"$CONF_FILE"
+	# shellcheck disable=SC2034
+	CFG_LOADED=1
+	return 0
+}
+
+# Atomic write: .new -> mv, mode 0600. Keeps keys other components own.
+cfg_save() {
+	local k tmp=$CONF_FILE.new extra=""
+	mkdir -p -- "$CONF_DIR" || die err_mkdir "$CONF_DIR"
+	if [[ -r $CONF_FILE ]]; then
+		while IFS= read -r k; do
+			[[ $k =~ ^([a-z_][a-z0-9_]*)= ]] && [[ ! -v CFG[${BASH_REMATCH[1]}] ]] && extra+=$k$'\n'
+		done <"$CONF_FILE"
+	fi
+	{
+		printf '# bb configuration - managed by bb, KEY='"'"'value'"'"' lines only\n' # bb-lint: ok
+		for k in $(printf '%s\n' "${!CFG[@]}" | sort); do
+			printf "%s='%s'\n" "$k" "${CFG[$k]}"
+		done
+		if [[ -n $extra ]]; then printf '%s' "$extra"; fi
+	} >"$tmp" || die err_write "$tmp"
+	chmod 0600 "$tmp" && mv -f -- "$tmp" "$CONF_FILE" || die err_write "$CONF_FILE"
+}
+
+cfg_set() {
+	cfg_valid "$1" "$2" || die err_cfg_invalid "$1" "$2"
+	CFG[$1]=$2
+	cfg_save
+}
+
+effective_lang() { # --lang, BB_LANG, bb.conf, en
+	local l=${ARG_LANG:-${BB_LANG:-}}
+	[[ -n $l ]] || l=${CFG[lang]:-en}
+	[[ $l == en || $l == ru ]] || l=en
+	printf '%s\n' "$l"
+}
+
+# Atomic replace of a text file from stdin.
+write_atomic() { # path
+	local path=$1 tmp=$1.new
+	cat >"$tmp" || { rm -f -- "$tmp"; return 1; }
+	chmod 0600 "$tmp" && mv -f -- "$tmp" "$path"
+}
+
+# ---------------------------------------------------------------------------
+# 3. Firewall abstraction layer
+#    fw_init fw_apply fw_check fw_status fw_remove fw_backup fw_rollback
+#    set_replace set_add set_del flow_add
+#    The rest of the program never touches a backend directly.
+# ---------------------------------------------------------------------------
+FW=""
+
+fw_families() {
+	printf '4\n'
+	[[ ${CFG[ipv6]} == yes ]] && printf '6\n'
+	return 0
+}
+
+# ---- backend detection (tech.md section 3) -------------------------------
+D_IPT=0 D_IPSET=0 D_NFT=0
+DETECT_BACKEND="" DETECT_PKGS=""
+
+detect_tools() {
+	D_IPT=0 D_IPSET=0 D_NFT=0
+	have iptables && D_IPT=1
+	if have ipset && ipset list -n >/dev/null 2>&1; then D_IPSET=1; fi
+	if have nft && nft list tables >/dev/null 2>&1; then D_NFT=1; fi
+	return 0
+}
+
+iptables_variant() { # prints nf_tables | legacy | unknown
+	local v
+	v=$(iptables -V 2>/dev/null) || { printf 'unknown\n'; return; }
+	case $v in
+		*nf_tables*) printf 'nf_tables\n' ;;
+		*legacy*) printf 'legacy\n' ;;
+		*) printf 'legacy\n' ;; # old iptables without a variant tag is xtables
+	esac
+}
+
+# Sets DETECT_BACKEND and DETECT_PKGS (logical package names, may be empty).
+detect_backend() {
+	detect_tools
+	DETECT_PKGS=""
+	if ((D_IPT && D_IPSET)); then
+		DETECT_BACKEND=iptables
+	elif ((D_NFT)); then
+		DETECT_BACKEND=nft
+	elif ((D_IPT)); then
+		DETECT_BACKEND=iptables
+		DETECT_PKGS=ipset
+	elif [[ ${CFG[install_backend]} == iptables ]]; then
+		DETECT_BACKEND=iptables
+		DETECT_PKGS="iptables ipset"
+	else
+		DETECT_BACKEND=nft
+		# shellcheck disable=SC2034
+		DETECT_PKGS=nftables
+	fi
+}
+
+fw_select() { # sets FW from bb.conf
+	case ${CFG[backend]} in
+		iptables) FW=ipt ;;
+		nft) FW=nft ;;
+		*) die err_not_configured ;;
+	esac
+}
+
+fw_tools_ok() {
+	local missing=""
+	if [[ $FW == ipt ]]; then
+		local c
+		for c in iptables iptables-restore iptables-save ipset; do have "$c" || missing+=" $c"; done
+		if [[ ${CFG[ipv6]} == yes ]]; then
+			for c in ip6tables ip6tables-restore ip6tables-save; do have "$c" || missing+=" $c"; done
+		fi
+	else
+		have nft || missing+=" nft"
+	fi
+	[[ -z $missing ]] || { err err_tools_missing "${missing# }"; return 1; }
+}
+
+# Dispatchers.
+# shellcheck disable=SC2120
+fw_init() { "${FW}_init" "$@"; }
+# shellcheck disable=SC2120
+fw_apply() { "${FW}_apply" "$@"; }
+# shellcheck disable=SC2120
+fw_check() { "${FW}_check" "$@"; }
+# shellcheck disable=SC2120
+fw_status() { "${FW}_status" "$@"; }
+# shellcheck disable=SC2120
+fw_remove() { "${FW}_remove" "$@"; }
+fw_backup() { "${FW}_backup" "$@"; }
+fw_rollback() { "${FW}_rollback" "$@"; }
+set_replace() { "${FW}_set_replace" "$@"; } # kind fam file
+set_add() { "${FW}_set_add" "$@"; }         # kind fam entry [ttl_seconds]
+set_del() { "${FW}_set_del" "$@"; }         # kind fam entry
+flow_add() { "${FW}_flow_add" "$@"; }       # fam src sport dst dport proto ttl
+
+# Ports for the DHT rule, canonical "6881-6889,51413".
+dht_port_mode() { printf '%s\n' "${CFG[ports_mode]}"; }
+
+# ---- iptables + ipset backend ----------------------------------------------
+ipt_bin() { [[ $1 == 4 ]] && printf 'iptables\n' || printf 'ip6tables\n'; }
+ipt_set() { printf 'bb_%s%s\n' "$1" "$2"; } # kind fam
+
+ipt_hashsize() { # element count -> power of two, 1024..4194304
+	local n=${1:-0} h=1024
+	while ((h * 2 < n && h < 4194304)); do h=$((h * 2)); done
+	printf '%d\n' "$h"
+}
+
+ipt_set_args() { # kind fam [count]
+	local kind=$1 fam=$2 count=${3:-0} f=inet
+	[[ $fam == 6 ]] && f=inet6
+	case $kind in
+		allow) printf 'hash:net family %s maxelem 65536 hashsize 1024\n' "$f" ;;
+		manual) printf 'hash:net family %s maxelem 65536 hashsize 1024 timeout 0\n' "$f" ;;
+		list) printf 'hash:net family %s maxelem %s hashsize %s\n' "$f" "${CFG[list_maxelem]}" "$(ipt_hashsize "$count")" ;;
+		dht) printf 'hash:ip,port family %s maxelem 65536 hashsize 1024\n' "$f" ;;
+		flow_src | flow_dst)
+			printf 'hash:ip,port family %s maxelem %s hashsize 1024 timeout %s\n' "$f" "${CFG[flow_maxelem]}" "$(dur2sec "${CFG[flow_ttl]}")" ;;
+	esac
+}
+
+ipt_init() {
+	local f kind name
+	for f in $(fw_families); do
+		for kind in allow manual list dht flow_src flow_dst; do
+			name=$(ipt_set "$kind" "$f")
+			# shellcheck disable=SC2046
+			ipset create -exist "$name" $(ipt_set_args "$kind" "$f") 2>/dev/null ||
+				ipset list -n "$name" >/dev/null 2>&1 || { err err_fw_init "$name"; return 1; }
+		done
+	done
+}
+
+ipt_emit() { # category match...
+	local cat=$1 m=$2
+	if [[ ${CFG[mode]} == block ]]; then
+		printf -- '-A BB_FILTER %s -m comment --comment "bb:%s" -j DROP\n' "$m" "$cat"
+	else
+		printf -- '-A BB_FILTER %s -m comment --comment "bb:%s"\n' "$m" "$cat"
+		printf -- '-A BB_FILTER %s -m limit --limit 10/second --limit-burst 20 -j LOG --log-prefix "bb: %s "\n' "$m" "$cat"
+		printf -- '-A BB_FILTER %s -j RETURN\n' "$m"
+	fi
+}
+
+ipt_port_match() { # multiport expression for the DHT rule, or nothing
+	local l=${CFG[ports]}
+	l=${l//-/:}
+	case ${CFG[ports_mode]} in
+		only) printf -- '-m multiport --ports %s' "$l" ;;
+		except) printf -- '-m multiport ! --ports %s' "$l" ;;
+	esac
+}
+
+ipt_rules() { # fam -> iptables-restore input (one atomic transaction)
+	local f=$1 d mp
+	printf '*raw\n:BB_FILTER - [0:0]\n-F BB_FILTER\n'
+	printf -- '-A BB_FILTER -i lo -j RETURN\n-A BB_FILTER -o lo -j RETURN\n'
+	for d in src dst; do
+		printf -- '-A BB_FILTER -m set --match-set bb_allow%s %s -j RETURN\n' "$f" "$d"
+	done
+	for d in src dst; do ipt_emit manual "-m set --match-set bb_manual$f $d"; done
+	for d in src dst; do ipt_emit list "-m set --match-set bb_list$f $d"; done
+	mp=$(ipt_port_match)
+	for d in dst src; do ipt_emit dht "-p udp -m set --match-set bb_dht$f $d,$d $mp"; done
+	ipt_emit flow "-m set --match-set bb_flow_src$f src,src -m set --match-set bb_flow_dst$f dst,dst"
+	ipt_emit flow "-m set --match-set bb_flow_src$f dst,dst -m set --match-set bb_flow_dst$f src,src"
+	printf 'COMMIT\n'
+}
+
+# Exactly one jump to BB_FILTER, first in PREROUTING and OUTPUT of raw.
+# The new jump is inserted before the stale ones are deleted: protection never lapses.
+ipt_ensure_jump() { # fam
+	local bin hook nums n
+	bin=$(ipt_bin "$1")
+	for hook in PREROUTING OUTPUT; do
+		nums=$("$bin" -w -t raw -L "$hook" --line-numbers -n 2>/dev/null | awk '$2 == "BB_FILTER" { print $1 }')
+		[[ $nums == 1 ]] && continue
+		"$bin" -w -t raw -I "$hook" 1 -j BB_FILTER || return 1
+		for n in $(printf '%s\n' $nums | sort -rn); do
+			"$bin" -w -t raw -D "$hook" "$((n + 1))" || return 1
+		done
+	done
+}
+
+ipt_apply() {
+	local f bin
+	mk_tmpdir
+	for f in $(fw_families); do
+		bin=$(ipt_bin "$f")
+		ipt_rules "$f" >"$TMPD/rules$f"
+		"${bin}-restore" --test --noflush <"$TMPD/rules$f" || { err err_rules_syntax; return 1; }
+	done
+	for f in $(fw_families); do
+		bin=$(ipt_bin "$f")
+		"${bin}-restore" --noflush -w <"$TMPD/rules$f" || return 1
+		ipt_ensure_jump "$f" || return 1
+	done
+}
+
+ipt_check() { # 0 = rules in place and first in order
+	local f bin hook first cnt
+	for f in $(fw_families); do
+		bin=$(ipt_bin "$f")
+		"$bin" -w -t raw -S BB_FILTER >/dev/null 2>&1 || return 1
+		ipset list -n "$(ipt_set manual "$f")" >/dev/null 2>&1 || return 1
+		for hook in PREROUTING OUTPUT; do
+			first=$("$bin" -w -t raw -S "$hook" 2>/dev/null | sed -n '2p')
+			[[ $first == "-A $hook -j BB_FILTER" ]] || return 1
+			cnt=$("$bin" -w -t raw -S "$hook" 2>/dev/null | grep -c -- '-j BB_FILTER$')
+			[[ $cnt == 1 ]] || return 1
+		done
+	done
+}
+
+ipt_remove() {
+	local f bin hook s
+	for f in 4 6; do
+		bin=$(ipt_bin "$f")
+		have "$bin" || continue
+		for hook in PREROUTING OUTPUT; do
+			while "$bin" -w -t raw -D "$hook" -j BB_FILTER 2>/dev/null; do :; done
+		done
+		"$bin" -w -t raw -F BB_FILTER 2>/dev/null
+		"$bin" -w -t raw -X BB_FILTER 2>/dev/null
+	done
+	if have ipset; then
+		for s in $(ipset list -n 2>/dev/null | grep '^bb_'); do ipset destroy "$s" 2>/dev/null; done
+	fi
+	return 0
+}
+
+ipt_backup() { # dir
+	local d=$1 f bin
+	for f in $(fw_families); do
+		bin=$(ipt_bin "$f")
+		"${bin}-save" -t raw >"$d/${bin}.save" 2>/dev/null
+	done
+	if have ipset; then
+		ipset save 2>/dev/null | awk '$2 ~ /^bb_/' >"$d/ipset.save"
+	fi
+	return 0
+}
+
+ipt_rollback() { # dir: put the chains back as they were
+	local d=$1 f bin
+	for f in $(fw_families); do
+		bin=$(ipt_bin "$f")
+		if [[ -s $d/${bin}.save ]] && grep -q '^:BB_FILTER' "$d/${bin}.save"; then
+			{
+				printf '*raw\n:BB_FILTER - [0:0]\n-F BB_FILTER\n'
+				grep '^-A BB_FILTER ' "$d/${bin}.save"
+				printf 'COMMIT\n'
+			} | "${bin}-restore" --noflush -w 2>/dev/null
+		fi
+	done
+	return 0
+}
+
+# Entries file: "entry [timeout_seconds]" per line (dht: "ip,udp:port").
+ipt_set_replace() { # kind fam file
+	local kind=$1 fam=$2 file=$3 name tmp count
+	name=$(ipt_set "$kind" "$fam")
+	tmp=bb_tmp_$kind$fam
+	count=$(wc -l <"$file")
+	ipset destroy "$tmp" >/dev/null 2>&1
+	{
+		# shellcheck disable=SC2046
+		printf 'create %s %s\n' "$tmp" "$(ipt_set_args "$kind" "$fam" "$count")"
+		awk -v n="$tmp" '{ if (NF > 1) print "add " n " " $1 " timeout " $2; else print "add " n " " $1 }' "$file"
+		printf 'swap %s %s\ndestroy %s\n' "$tmp" "$name" "$tmp"
+	} | ipset restore -exist 2>/dev/null
+	local rc=$?
+	((rc != 0)) && ipset destroy "$tmp" >/dev/null 2>&1
+	return "$rc"
+}
+
+ipt_set_add() { # kind fam entry [ttl]
+	local name
+	name=$(ipt_set "$1" "$2")
+	if [[ -n ${4:-} ]]; then ipset add -exist "$name" "$3" timeout "$4" 2>/dev/null
+	else ipset add -exist "$name" "$3" 2>/dev/null; fi
+}
+
+ipt_set_del() { ipset del "$(ipt_set "$1" "$2")" "$3" 2>/dev/null; }
+
+ipt_flow_add() { # fam src sport dst dport proto ttl
+	local fam=$1 sip=$2 sp=$3 dip=$4 dp=$5 proto=$6 ttl=$7
+	ipset add -exist "$(ipt_set flow_src "$fam")" "$sip,$proto:$sp" timeout "$ttl" 2>/dev/null || return 1
+	ipset add -exist "$(ipt_set flow_dst "$fam")" "$dip,$proto:$dp" timeout "$ttl" 2>/dev/null
+}
+
+# status output, machine form: "set <name> <count>" and "counter <cat> <pkts> <bytes>"
+ipt_status() {
+	local f bin kind name n
+	for f in $(fw_families); do
+		for kind in allow manual list dht flow_src flow_dst; do
+			name=$(ipt_set "$kind" "$f")
+			n=$(ipset list -t "$name" 2>/dev/null | awk -F': ' '/^Number of entries/ { print $2 }')
+			printf 'set %s %s\n' "${kind}${f}" "${n:--}"
+		done
+	done
+	for f in $(fw_families); do
+		bin=$(ipt_bin "$f")
+		"$bin" -w -t raw -L BB_FILTER -nvx 2>/dev/null
+	done | awk '
+		match($0, /bb:[a-z]+/) { c = substr($0, RSTART + 3, RLENGTH - 3); p[c] += $1; b[c] += $2 }
+		END { for (c in p) printf "counter %s %d %d\n", c, p[c], b[c] }'
+}
+
+# ---- nft backend ------------------------------------------------------------
+nft_atype() { [[ $1 == 4 ]] && printf 'ipv4_addr\n' || printf 'ipv6_addr\n'; }
+
+nft_prio_name() { # nft prints well-known priorities by name
+	case $1 in
+		raw) printf -- '-300\n' ;; mangle) printf -- '-150\n' ;; filter) printf '0\n' ;;
+		dstnat) printf -- '-100\n' ;; security) printf '50\n' ;; srcnat) printf '100\n' ;;
+		*) printf '%s\n' "$1" ;;
+	esac
+}
+
+# nft may print a priority symbolically ("raw - 10"); stdin: chain listing -> number.
+nft_prio_of() {
+	local txt base off=0
+	txt=$(sed -n 's/.*priority \([^;]*\);.*/\1/p')
+	[[ -n $txt ]] || return 1
+	# shellcheck disable=SC2086
+	set -- $txt
+	if [[ $1 =~ ^-?[0-9]+$ ]]; then printf '%s\n' "$1"; return 0; fi
+	base=$(nft_prio_name "$1")
+	[[ ${2:-} == + ]] && off=${3:-0}
+	[[ ${2:-} == - ]] && off=$((-${3:-0}))
+	printf '%d\n' "$((base + off))"
+}
+
+# A base chain's priority cannot be changed in place: recreate it if it differs.
+nft_fix_priority() {
+	local hook cur
+	for hook in prerouting output; do
+		cur=$(nft list chain inet bb "$hook" 2>/dev/null | nft_prio_of) || continue
+		[[ $cur == "${CFG[hook_priority]}" ]] && continue
+		printf 'flush chain inet bb %s\ndelete chain inet bb %s\n' "$hook" "$hook" | nft -f - || return 1
+	done
+}
+
+nft_structure() { # idempotent definition of table, sets and chains
+	local f a
+	printf 'add table inet bb\n'
+	for f in $(fw_families); do
+		a=$(nft_atype "$f")
+		printf 'add set inet bb allow%s { type %s; flags interval; auto-merge; }\n' "$f" "$a"
+		printf 'add set inet bb manual%s { type %s; flags interval,timeout; auto-merge; }\n' "$f" "$a"
+		printf 'add set inet bb list%s { type %s; flags interval; auto-merge; }\n' "$f" "$a"
+		printf 'add set inet bb dht%s { type %s . inet_service; }\n' "$f" "$a"
+		printf 'add set inet bb flow%s { type %s . inet_service . %s . inet_service; flags timeout; timeout %ss; size %s; }\n' \
+			"$f" "$a" "$a" "$(dur2sec "${CFG[flow_ttl]}")" "${CFG[flow_maxelem]}"
+	done
+	printf 'add chain inet bb bb_main\nadd chain inet bb bb_dht\n'
+	printf 'add chain inet bb prerouting { type filter hook prerouting priority %s; policy accept; }\n' "${CFG[hook_priority]}"
+	printf 'add chain inet bb output { type filter hook output priority %s; policy accept; }\n' "${CFG[hook_priority]}"
+}
+
+nft_init() {
+	nft_fix_priority || return 1
+	nft_structure | nft -f - || { err err_fw_init "inet bb"; return 1; }
+}
+
+nft_emit() { # category expression [chain]
+	local cat=$1 e=$2 c=${3:-bb_main}
+	if [[ ${CFG[mode]} == block ]]; then
+		printf 'add rule inet bb %s %s counter drop comment "bb:%s"\n' "$c" "$e" "$cat"
+	else
+		printf 'add rule inet bb %s %s counter comment "bb:%s"\n' "$c" "$e" "$cat"
+		printf 'add rule inet bb %s %s limit rate 10/second burst 20 packets log prefix "bb: %s "\n' "$c" "$e" "$cat"
+		printf 'add rule inet bb %s %s return\n' "$c" "$e"
+	fi
+}
+
+nft_ports_set() { local l=${CFG[ports]}; printf '{ %s }' "${l//,/, }"; }
+
+nft_dht_chain() {
+	local pl
+	pl=$(nft_ports_set)
+	printf 'flush chain inet bb bb_dht\n'
+	case ${CFG[ports_mode]} in
+		all) nft_emit dht "" bb_dht ;;
+		except)
+			printf 'add rule inet bb bb_dht udp sport %s return\n' "$pl"
+			printf 'add rule inet bb bb_dht udp dport %s return\n' "$pl"
+			nft_emit dht "" bb_dht ;;
+		only)
+			nft_emit dht "udp sport $pl" bb_dht
+			nft_emit dht "udp dport $pl" bb_dht ;;
+	esac
+}
+
+nft_rules() {
+	local f ip dir
+	nft_structure
+	printf 'flush chain inet bb bb_main\n'
+	printf 'add rule inet bb bb_main iifname "lo" return\n'
+	printf 'add rule inet bb bb_main oifname "lo" return\n'
+	nft_dht_chain
+	for f in $(fw_families); do
+		ip=ip
+		[[ $f == 6 ]] && ip=ip6
+		for dir in saddr daddr; do printf 'add rule inet bb bb_main %s %s @allow%s return\n' "$ip" "$dir" "$f"; done
+		for dir in saddr daddr; do nft_emit manual "$ip $dir @manual$f"; done
+		for dir in saddr daddr; do nft_emit list "$ip $dir @list$f"; done
+		# DHT: the port mode lives in the bb_dht sub-chain. Chained "!=" on adjacent
+		# payload fields is merged by nft into one comparison with different
+		# meaning, so exemptions are explicit "return" rules instead.
+		printf 'add rule inet bb bb_main %s daddr . udp dport @dht%s jump bb_dht\n' "$ip" "$f"
+		printf 'add rule inet bb bb_main %s saddr . udp sport @dht%s jump bb_dht\n' "$ip" "$f"
+		nft_emit flow "meta l4proto { tcp, udp } $ip saddr . th sport . $ip daddr . th dport @flow$f"
+		nft_emit flow "meta l4proto { tcp, udp } $ip daddr . th dport . $ip saddr . th sport @flow$f"
+	done
+	printf 'flush chain inet bb prerouting\nadd rule inet bb prerouting jump bb_main\n'
+	printf 'flush chain inet bb output\nadd rule inet bb output jump bb_main\n'
+}
+
+nft_apply() {
+	mk_tmpdir
+	nft_fix_priority || return 1
+	nft_rules >"$TMPD/nft.rules"
+	nft -c -f "$TMPD/nft.rules" || { err err_rules_syntax; return 1; }
+	nft -f "$TMPD/nft.rules"
+}
+
+nft_check() {
+	local hook cur
+	nft list chain inet bb bb_main >/dev/null 2>&1 || return 1
+	for hook in prerouting output; do
+		cur=$(nft list chain inet bb "$hook" 2>/dev/null) || return 1
+		[[ $cur == *"jump bb_main"* ]] || return 1
+		[[ $(nft_prio_of <<<"$cur") == "${CFG[hook_priority]}" ]] || return 1
+	done
+}
+
+nft_remove() { nft delete table inet bb 2>/dev/null; return 0; }
+
+nft_backup() { nft list table inet bb >"$1/nft.save" 2>/dev/null; return 0; }
+
+nft_rollback() {
+	local d=$1
+	if [[ -s $d/nft.save ]]; then
+		{ printf 'add table inet bb\ndelete table inet bb\n'; cat "$d/nft.save"; } | nft -f - 2>/dev/null
+	else
+		nft_remove
+	fi
+}
+
+nft_elem() { # kind entry -> element expression
+	local e=$2 ip port
+	if [[ $1 == dht ]]; then
+		ip=${e%%,*}
+		port=${e##*:}
+		printf '%s . %s' "$ip" "$port"
+	else
+		printf '%s' "$e"
+	fi
+}
+
+nft_set_replace() { # kind fam file
+	local kind=$1 fam=$2 file=$3
+	{
+		printf 'flush set inet bb %s%s\n' "$kind" "$fam"
+		awk -v name="$kind$fam" -v kind="$kind" '
+			{
+				e = $1; to = (NF > 1) ? " timeout " $2 "s" : ""
+				if (kind == "dht") { split(e, p, ","); sub(/^[a-z]+:/, "", p[2]); e = p[1] " . " p[2] }
+				buf = buf (n ? ", " : "") e to
+				if (++n == 500) { print "add element inet bb " name " { " buf " }"; n = 0; buf = "" }
+			}
+			END { if (n) print "add element inet bb " name " { " buf " }" }' "$file"
+	} | nft -f - 2>/dev/null
+}
+
+nft_set_add() { # kind fam entry [ttl]
+	local el
+	el=$(nft_elem "$1" "$3")
+	# nft does not refresh the timeout of an existing element: replace it.
+	nft delete element inet bb "$1$2" "{ $el }" 2>/dev/null
+	if [[ -n ${4:-} ]]; then
+		nft add element inet bb "$1$2" "{ $el timeout ${4}s }" 2>/dev/null
+	else
+		nft add element inet bb "$1$2" "{ $el }" 2>/dev/null
+	fi
+}
+
+nft_set_del() { nft delete element inet bb "$1$2" "{ $(nft_elem "$1" "$3") }" 2>/dev/null; }
+
+nft_flow_add() { # fam src sport dst dport proto ttl
+	local el="$2 . $3 . $4 . $5"
+	nft delete element inet bb "flow$1" "{ $el }" 2>/dev/null
+	nft add element inet bb "flow$1" "{ $el timeout ${7}s }" 2>/dev/null
+}
+
+nft_status() {
+	local f kind name n
+	for f in $(fw_families); do
+		for kind in allow manual list dht flow; do
+			name=$kind$f
+			n=$(nft list set inet bb "$name" 2>/dev/null | awk '
+				/elements = \{/ { on = 1 }
+				on { s = s $0 }
+				on && /\}/ { on = 0 }
+				END { if (s == "") { print 0; exit }
+				      sub(/^[^{]*\{/, "", s); sub(/\}.*$/, "", s); gsub(/[ \t]/, "", s)
+				      print (s == "") ? 0 : gsub(/,/, ",", s) + 1 }')
+			printf 'set %s %s\n' "$name" "${n:--}"
+		done
+	done
+	{ nft list chain inet bb bb_main; nft list chain inet bb bb_dht; } 2>/dev/null | awk '
+		/counter packets/ && match($0, /comment "bb:[a-z]+"/) {
+			c = substr($0, RSTART + 12, RLENGTH - 13)
+			split(substr($0, index($0, "counter packets")), a, " ")
+			p[c] += a[3]; b[c] += a[5]
+		}
+		END { for (c in p) printf "counter %s %d %d\n", c, p[c], b[c] }'
+}
+
+# ---------------------------------------------------------------------------
+# 4. Data sources: allowlist, manual bans, lists, DHT nodes
+# ---------------------------------------------------------------------------
+fam_of() { [[ $1 == *:* ]] && printf '6\n' || printf '4\n'; }
+
+# Entries of one family from a "entry [x]" file, printing only the entry.
+file_family() { # file fam
+	[[ -r $1 ]] || return 0
+	awk -v f="$2" '{ is6 = index($1, ":") > 0; if ((f == 6) == is6) print $1 }' "$1"
+}
+
+manual_family() { # fam -> "entry [remaining_seconds]" for unexpired bans
+	[[ -r $MANUAL_FILE ]] || return 0
+	awk -v f="$1" -v now="$(date +%s)" '
+		$2 != 0 && $2 <= now { next }
+		{ is6 = index($1, ":") > 0; if ((f == 6) != is6) next
+		  if ($2 == 0) print $1; else print $1, $2 - now }' "$MANUAL_FILE"
+}
+
+manual_prune() {
+	[[ -r $MANUAL_FILE ]] || return 0
+	awk -v now="$(date +%s)" '$2 == 0 || $2 > now' "$MANUAL_FILE" | write_atomic "$MANUAL_FILE"
+}
+
+list_entries() { # fam -> union of all list caches
+	local f
+	for f in "$CACHE_DIR"/*.list; do [[ -r $f ]] && cat -- "$f"; done 2>/dev/null |
+		sort -u | awk -v f="$1" '{ is6 = index($1, ":") > 0; if ((f == 6) == is6) print $1 }'
+}
+
+dht_entries() { # fam
+	[[ -r $DHT_CACHE ]] || return 0
+	# the family comes from the address part only ("ip,udp:port" has a colon in the port part)
+	awk -v f="$1" '{ split($1, a, ","); is6 = index(a[1], ":") > 0; if ((f == 6) == is6) print $1 }' "$DHT_CACHE"
+}
+
+sets_refresh() { # kind: list | dht
+	local kind=$1 f rc=0
+	mk_tmpdir
+	for f in $(fw_families); do
+		"${kind}_entries" "$f" >"$TMPD/ent.$kind.$f"
+		set_replace "$kind" "$f" "$TMPD/ent.$kind.$f" || { err err_set_load "$kind$f"; rc=1; }
+	done
+	return "$rc"
+}
+
+sets_load_all() {
+	local f rc=0
+	mk_tmpdir
+	manual_prune
+	for f in $(fw_families); do
+		file_family "$ALLOW_FILE" "$f" >"$TMPD/allow.$f"
+		set_replace allow "$f" "$TMPD/allow.$f" || { err err_set_load "allow$f"; rc=1; }
+		manual_family "$f" >"$TMPD/manual.$f"
+		set_replace manual "$f" "$TMPD/manual.$f" || { err err_set_load "manual$f"; rc=1; }
+	done
+	sets_refresh list || rc=1
+	sets_refresh dht || rc=1
+	return "$rc"
+}
+
+# ---- external lists -------------------------------------------------------
+L_TYPE="" L_SOURCE="" L_SHA=""
+
+list_name_valid() { [[ $1 =~ ^[a-z0-9][a-z0-9_-]{0,31}$ && $1 != dht ]]; }
+
+list_read() { # name
+	local line f=$LISTS_D/$1.conf
+	L_TYPE="" L_SOURCE="" L_SHA=""
+	[[ -r $f ]] || return 1
+	while IFS= read -r line || [[ -n $line ]]; do
+		if [[ $line =~ ^(type|source|sha256)=\'([^\']*)\'$ ]]; then
+			case ${BASH_REMATCH[1]} in
+				type) L_TYPE=${BASH_REMATCH[2]} ;;
+				source) L_SOURCE=${BASH_REMATCH[2]} ;;
+				sha256) L_SHA=${BASH_REMATCH[2]} ;;
+			esac
+		fi
+	done <"$f"
+	[[ $L_TYPE == url || $L_TYPE == file ]] && [[ -n $L_SOURCE ]]
+}
+
+list_meta_get() { # name key
+	[[ -r $CACHE_DIR/$1.meta ]] || return 0
+	sed -n "s/^$2='\\([^']*\\)'\$/\\1/p" "$CACHE_DIR/$1.meta"
+}
+
+# fetch_source type source dest -> 0 ok, 1 failed, 2 too big
+fetch_source() {
+	local type=$1 src=$2 dest=$3 max=${CFG[list_max_size]} sz
+	local -a rcs
+	if [[ $type == file ]]; then
+		[[ -f $src && -r $src ]] || return 1
+		head -c "$((max + 1))" -- "$src" >"$dest" || return 1
+	else
+		[[ $src == https://* ]] || return 1
+		if have curl; then
+			curl -fsS --proto =https --proto-redir =https --max-time 120 --retry 3 --retry-delay 2 \
+				--max-filesize "$max" -o - -- "$src" 2>/dev/null | head -c "$((max + 1))" >"$dest"
+		elif have wget; then
+			wget -q --https-only --timeout=60 --tries=3 -O - -- "$src" 2>/dev/null | head -c "$((max + 1))" >"$dest"
+		else
+			return 1
+		fi
+		rcs=("${PIPESTATUS[@]}")
+	fi
+	sz=$(stat -c %s "$dest" 2>/dev/null || printf 0)
+	((sz > max)) && return 2
+	[[ $type == url ]] && ((rcs[0] != 0)) && return 1
+	return 0
+}
+
+resolve_hosts() { # stdin: host names; stdout: raw addresses (untrusted until normalized)
+	local h
+	while IFS= read -r h; do
+		timeout 5 getent ahosts "$h" 2>/dev/null | awk '{ print $1 }' | sort -u
+	done
+}
+
+# list_normalize raw out: validated, sanitized, resolved, unique entries.
+list_normalize() {
+	local raw=$1 out=$2 strip=0
+	[[ ${CFG[strip_private]} == yes ]] && strip=1
+	awk -v strip=$strip -v minp4=$MIN_PREFIX4 -v minp6=$MIN_PREFIX6 -v hosts=1 -v stats="$TMPD/stats" \
+		-f "$AWK_NET" "$raw" >"$TMPD/recs"
+	{
+		awk -F'\t' '$1 != "H" { print $2 }' "$TMPD/recs"
+		awk -F'\t' '$1 == "H" { print $2 }' "$TMPD/recs" | head -n "${CFG[resolve_max]}" | resolve_hosts |
+			awk -v strip=$strip -v minp4=0 -v minp6=0 -v hosts=0 -f "$AWK_NET" | awk -F'\t' '{ print $2 }'
+	} | sort -u >"$out"
+}
+
+# 0 updated, 1 failed, 2 rejected by the safety checks
+list_update_one() {
+	local name=$1 raw ent new prev rc sha ratio=${CFG[min_list_ratio]}
+	list_read "$name" || { warn warn_list_bad_desc "$name"; return 1; }
+	mk_tmpdir
+	raw=$TMPD/raw.$name ent=$TMPD/ent.$name
+	fetch_source "$L_TYPE" "$L_SOURCE" "$raw"
+	rc=$?
+	if ((rc == 2)); then
+		warn warn_list_too_big "$name"; log_event "list_rejected name=$name reason=size"; return 2
+	elif ((rc != 0)); then
+		warn warn_list_fetch "$name"; log_event "list_update_failed name=$name"; return 1
+	fi
+	if [[ -n $L_SHA ]]; then
+		sha=$(sha256sum "$raw" | cut -d' ' -f1)
+		if [[ ${sha,,} != "${L_SHA,,}" ]]; then
+			warn warn_list_sha "$name"; log_event "list_update_failed name=$name reason=sha256"; return 1
+		fi
+	fi
+	list_normalize "$raw" "$ent"
+	new=$(wc -l <"$ent")
+	prev=$(list_meta_get "$name" count)
+	prev=${prev:-0}
+	if ((new == 0)); then
+		warn warn_list_empty "$name"; log_event "list_rejected name=$name reason=empty"; return 2
+	fi
+	if ((prev > 0 && new * 100 < prev * ratio)); then
+		warn warn_list_shrunk "$name" "$prev" "$new"; log_event "list_rejected name=$name reason=shrunk"; return 2
+	fi
+	mkdir -p -- "$CACHE_DIR"
+	mv -f -- "$ent" "$CACHE_DIR/$name.list"
+	printf "count='%s'\nupdated='%s'\n" "$new" "$(date +%s)" | write_atomic "$CACHE_DIR/$name.meta"
+	say list_updated "$name" "$new"
+	log_event "list_updated name=$name entries=$new"
+	return 0
+}
+
+DHT_DEFAULT_NODES='router.bittorrent.com:6881
+router.utorrent.com:6881
+dht.transmissionbt.com:6881
+dht.libtorrent.org:25401
+dht.aelitis.com:6881'
+
+dht_seed_nodes() {
+	[[ -e $DHT_NODES_FILE ]] && return 0
+	mkdir -p -- "$CONF_DIR"
+	{ printf '# DHT bootstrap nodes, one "name:port" (or "ip:port", "[ipv6]:port") per line\n'; # bb-lint: ok
+	  printf '%s\n' "$DHT_DEFAULT_NODES"; } | write_atomic "$DHT_NODES_FILE"
+}
+
+# 0 updated, 1 failed, 2 rejected
+dht_update() {
+	local line host port ips ip out new prev ratio=${CFG[min_list_ratio]} strip=0
+	[[ ${CFG[strip_private]} == yes ]] && strip=1
+	dht_seed_nodes
+	mk_tmpdir
+	out=$TMPD/dht.new
+	: >"$out"
+	while IFS= read -r line || [[ -n $line ]]; do
+		line=${line%%#*}
+		line=${line//[[:space:]]/}
+		[[ -n $line ]] || continue
+		port=${line##*:}
+		host=${line%:*}
+		host=${host#[}
+		host=${host%]}
+		[[ $port =~ ^[0-9]{1,5}$ ]] && ((10#$port >= 1 && 10#$port <= 65535)) || { warn warn_dht_line "$line"; continue; }
+		port=$((10#$port))
+		if [[ $host =~ ^[0-9A-Fa-f:.]+$ ]]; then
+			ips=$host
+		elif [[ $host =~ ^[A-Za-z0-9]([A-Za-z0-9_.-]*[A-Za-z0-9])?$ && ${#host} -le 253 ]]; then
+			ips=$(printf '%s\n' "$host" | resolve_hosts)
+		else
+			warn warn_dht_line "$line"; continue
+		fi
+		# Private/special addresses (incl. IPv4-mapped IPv6) are dropped here.
+		while IFS=$'\t' read -r _ ip; do
+			[[ -n $ip ]] && printf '%s,udp:%s\n' "$ip" "$port" >>"$out"
+		done < <(printf '%s\n' "$ips" | awk -v strip=$strip -v minp4=0 -v minp6=0 -v hosts=0 -f "$AWK_NET")
+	done <"$DHT_NODES_FILE"
+	sort -u -o "$out" "$out"
+	new=$(wc -l <"$out")
+	prev=0
+	[[ -r $DHT_CACHE ]] && prev=$(wc -l <"$DHT_CACHE")
+	if ((new == 0)); then
+		warn warn_dht_empty; log_event "list_rejected name=dht reason=empty"; return 2
+	fi
+	if ((prev > 0 && new * 100 < prev * ratio)); then
+		warn warn_dht_shrunk "$prev" "$new"; log_event "list_rejected name=dht reason=shrunk"; return 2
+	fi
+	mkdir -p -- "$STATE_DIR"
+	mv -f -- "$out" "$DHT_CACHE"
+	say dht_updated "$new"
+	log_event "list_updated name=dht entries=$new"
+	return 0
+}
+
+# ---------------------------------------------------------------------------
+# 5. Commands
+# ---------------------------------------------------------------------------
+ARG_LANG=""
+
+need_root() { [[ $EUID -eq 0 ]] || die err_need_root; }
+
+take_lock() {
+	have flock || die err_tools_missing flock
+	mkdir -p -- "$(dirname -- "$LOCK_FILE")"
+	exec 9>"$LOCK_FILE" || die err_write "$LOCK_FILE"
+	flock -w 30 9 || die err_lock
+}
+
+# Load configuration; $1=require -> must be configured (a backend chosen).
+load_config() {
+	cfg_load || true
+	if [[ ${1:-} == require ]]; then
+		[[ -n ${CFG[backend]} ]] || die err_not_configured
+		fw_select
+	elif [[ -n ${CFG[backend]} ]]; then
+		fw_select
+	fi
+}
+
+fw_live() { [[ -n $FW ]] && fw_check >/dev/null 2>&1; }
+
+# Rebuild everything from configuration; leaves the old state on failure.
+do_apply() {
+	local bdir=$BACKUP_DIR/last-apply
+	fw_tools_ok || return 1
+	mk_tmpdir
+	rm -rf -- "$bdir"
+	mkdir -p -- "$bdir"
+	fw_backup "$bdir"
+	fw_init || return 1
+	if ! sets_load_all; then fw_rollback "$bdir"; return 1; fi
+	if ! fw_apply; then
+		err err_apply_failed
+		fw_rollback "$bdir"
+		return 1
+	fi
+	log_event "apply backend=${CFG[backend]} mode=${CFG[mode]}"
+	return 0
+}
+
+cmd_apply() {
+	need_root; take_lock; load_config require
+	do_apply || exit 1
+	say apply_done "${CFG[backend]}" "${CFG[mode]}"
+}
+
+# Guard: used by bb-guard.timer. Quiet when everything is in place.
+cmd_guard() {
+	need_root; take_lock; load_config require
+	fw_tools_ok || exit 1
+	fw_check && exit 0
+	log_event "guard_restored backend=${CFG[backend]}"
+	do_apply || exit 1
+	say guard_restored
+}
+
+# Hidden helper (used by the installer and the tests): write a default bb.conf.
+cmd___init_config() {
+	need_root; take_lock
+	cfg_load || true
+	local backend=""
+	local v6=""
+	while (($#)); do
+		case $1 in
+			--backend) backend=${2:-}; shift 2 ;;
+			--ipv6) v6=${2:-}; shift 2 ;;
+			*) die err_unknown_opt "$1" ;;
+		esac
+	done
+	if [[ -z $backend ]]; then detect_backend; backend=$DETECT_BACKEND; fi
+	cfg_valid backend "$backend" || die err_cfg_invalid backend "$backend"
+	CFG[backend]=$backend
+	if [[ -n $v6 ]]; then cfg_valid ipv6 "$v6" || die err_cfg_invalid ipv6 "$v6"; CFG[ipv6]=$v6
+	elif [[ -s /proc/net/if_inet6 ]]; then CFG[ipv6]=yes; else CFG[ipv6]=no; fi
+	cfg_save
+	mkdir -p -- "$LISTS_D" "$STATE_DIR" "$BACKUP_DIR"
+	[[ -e $ALLOW_FILE ]] || : >"$ALLOW_FILE"
+	[[ -e $MANUAL_FILE ]] || : >"$MANUAL_FILE"
+	say config_written "$backend"
+}
+
+# entry-file editing shared by ban/allow
+entry_file_put() { # file entry expiry|""
+	local file=$1 e=$2 x=${3:-}
+	{
+		[[ -r $file ]] && awk -v e="$e" '$1 != e' "$file"
+		if [[ -n $x ]]; then printf '%s %s\n' "$e" "$x"; else printf '%s\n' "$e"; fi
+	} | write_atomic "$file"
+}
+
+entry_file_del() { # file entry -> 0 if it was present
+	local file=$1 e=$2
+	[[ -r $file ]] && awk -v e="$e" '$1 == e { f = 1 } END { exit !f }' "$file" || return 1
+	awk -v e="$e" '$1 != e' "$file" | write_atomic "$file"
+}
+
+cmd_ban() {
+	local entry="" ttl="" sec="" exp=0 line fam canon
+	while (($#)); do
+		case $1 in
+			--ttl) (($# >= 2)) || die err_usage ban; ttl=$2; shift 2 ;;
+			-*) die err_unknown_opt "$1" ;;
+			*) [[ -z $entry ]] || die err_usage ban; entry=$1; shift ;;
+		esac
+	done
+	[[ -n $entry ]] || die err_usage ban
+	need_root; take_lock; load_config
+	line=$(norm_entry "$entry") || die err_bad_entry "$entry"
+	fam=${line%%$'\t'*} canon=${line#*$'\t'}
+	if [[ -n $ttl ]]; then
+		sec=$(dur2sec "$ttl") || die err_bad_ttl "$ttl"
+		exp=$(($(date +%s) + sec))
+	fi
+	file_family "$ALLOW_FILE" "$fam" | grep -qxF -- "$canon" && warn warn_ban_allowed "$canon"
+	entry_file_put "$MANUAL_FILE" "$canon" "$exp" || die err_write "$MANUAL_FILE"
+	if [[ $fam == 6 && ${CFG[ipv6]} != yes ]]; then
+		: # IPv6 handling is off; the entry is kept in the file only
+	elif fw_live; then
+		set_add manual "$fam" "$canon" "$sec" || warn warn_set_op "$canon"
+	else
+		say note_not_applied
+	fi
+	log_event "manual_change op=ban entry=$canon"
+	say ban_done "$canon"
+}
+
+cmd_unban() {
+	[[ $# -eq 1 && $1 != -* ]] || die err_usage unban
+	need_root; take_lock; load_config
+	local line fam canon
+	line=$(norm_entry "$1") || die err_bad_entry "$1"
+	fam=${line%%$'\t'*} canon=${line#*$'\t'}
+	entry_file_del "$MANUAL_FILE" "$canon" || die err_not_banned "$canon"
+	fw_live && { set_del manual "$fam" "$canon" || true; }
+	log_event "manual_change op=unban entry=$canon"
+	say unban_done "$canon"
+}
+
+cmd_allow() {
+	local entry="" rm=0 line fam canon
+	while (($#)); do
+		case $1 in
+			--rm) rm=1; shift ;;
+			-*) die err_unknown_opt "$1" ;;
+			*) [[ -z $entry ]] || die err_usage allow; entry=$1; shift ;;
+		esac
+	done
+	[[ -n $entry ]] || die err_usage allow
+	need_root; take_lock; load_config
+	line=$(norm_entry "$entry") || die err_bad_entry "$entry"
+	fam=${line%%$'\t'*} canon=${line#*$'\t'}
+	if ((rm)); then
+		entry_file_del "$ALLOW_FILE" "$canon" || die err_not_allowed "$canon"
+		fw_live && { set_del allow "$fam" "$canon" || true; }
+		log_event "manual_change op=unallow entry=$canon"
+		say allow_removed "$canon"
+		return 0
+	fi
+	entry_file_put "$ALLOW_FILE" "$canon" "" || die err_write "$ALLOW_FILE"
+	if fw_live; then
+		set_add allow "$fam" "$canon" "" || warn warn_set_op "$canon"
+	else
+		say note_not_applied
+	fi
+	log_event "manual_change op=allow entry=$canon"
+	say allow_done "$canon"
+}
+
+cmd_mode() {
+	local want="" confirm="" rollback=0
+	while (($#)); do
+		case $1 in
+			--confirm)
+				if [[ ${2:-} =~ ^[0-9]+$ ]]; then confirm=$2; shift 2; else confirm=-1; shift; fi ;;
+			--rollback) rollback=1; shift ;;
+			-*) die err_unknown_opt "$1" ;;
+			*) [[ -z $want ]] || die err_usage mode; want=$1; shift ;;
+		esac
+	done
+	need_root; take_lock; load_config require
+	case $want in
+		monitor | block) ;;
+		confirm)
+			if systemctl stop bb-mode-rollback.timer >/dev/null 2>&1; then say mode_confirmed; else say mode_nothing_pending; fi
+			return 0 ;;
+		'') say mode_current "${CFG[mode]}"; return 0 ;;
+		*) die err_usage mode ;;
+	esac
+	if [[ $confirm == -1 ]]; then confirm=${CFG[confirm_timeout]}; fi
+	[[ $want == block && -n $confirm ]] || confirm=""
+	if [[ -n $confirm ]]; then
+		have systemd-run || die err_no_systemd_run
+		# Arm the rollback first: if the session dies, the timer still fires.
+		systemctl stop bb-mode-rollback.timer >/dev/null 2>&1
+		systemd-run --quiet --collect --unit=bb-mode-rollback --on-active="${confirm}s" \
+			"$SELF" mode monitor --rollback >/dev/null 2>&1 || die err_rollback_arm
+	elif [[ $want == monitor ]]; then
+		systemctl stop bb-mode-rollback.timer >/dev/null 2>&1
+	fi
+	local old=${CFG[mode]}
+	CFG[mode]=$want
+	if ! do_apply; then
+		CFG[mode]=$old
+		[[ -n $confirm ]] && systemctl stop bb-mode-rollback.timer >/dev/null 2>&1
+		exit 1
+	fi
+	cfg_save
+	if ((rollback)); then
+		log_event "mode_changed mode=$want reason=rollback"
+		say mode_rolled_back
+		return 0
+	fi
+	log_event "mode_changed mode=$want"
+	say mode_changed "$want"
+	if [[ -n $confirm ]]; then
+		say mode_confirm_hint "$confirm"
+		if [[ -t 0 && -t 1 ]]; then
+			local ans=""
+			printf '%s ' "$(t mode_confirm_prompt)"
+			if read -r -t "$confirm" ans && [[ ${ans,,} == y || ${ans,,} == yes ]]; then
+				systemctl stop bb-mode-rollback.timer >/dev/null 2>&1
+				say mode_confirmed
+			else
+				printf '\n'
+				CFG[mode]=monitor
+				systemctl stop bb-mode-rollback.timer >/dev/null 2>&1
+				do_apply && cfg_save
+				say mode_rolled_back
+			fi
+		fi
+	fi
+}
+
+cmd_lang() {
+	local want=${1:-}
+	cfg_load || true
+	if [[ -z $want ]]; then say lang_current "${CFG[lang]}"; return 0; fi
+	[[ $want == en || $want == ru ]] || die err_lang_invalid "$want"
+	need_root; take_lock
+	cfg_set lang "$want"
+	i18n_load "$want"
+	say lang_set "$want"
+}
+
+cmd_status() {
+	need_root; load_config require
+	local state="absent" l
+	fw_live && state=present
+	say status_title "$BB_VERSION"
+	if [[ $FW == ipt ]]; then say status_backend "iptables ($(iptables_variant))"; else say status_backend nft; fi
+	say status_mode "${CFG[mode]}"
+	say status_lang "${CFG[lang]}"
+	say "status_rules_$state"
+	[[ $state == present ]] || return 0
+	say status_sets
+	local out kind a b c
+	out=$(fw_status)
+	while read -r kind a b c; do
+		[[ $kind == set ]] && say status_set_line "$a" "$b"
+	done <<<"$out"
+	say status_counters
+	while read -r kind a b c; do
+		[[ $kind == counter ]] && say status_counter_line "$a" "$b" "$c"
+	done < <(sort <<<"$out")
+	return 0
+}
+
+cmd_list() {
+	local sub=${1:-show}
+	[[ $# -gt 0 ]] && shift
+	case $sub in
+		show)
+			load_config
+			local f n any=0
+			for f in "$LISTS_D"/*.conf; do
+				[[ -e $f ]] || continue
+				n=$(basename -- "$f" .conf)
+				list_read "$n" || continue
+				say list_line "$n" "$L_TYPE" "$(list_meta_get "$n" count)" "$L_SOURCE"
+				any=1
+			done
+			[[ -r $DHT_CACHE ]] && { say list_line_dht "$(wc -l <"$DHT_CACHE")"; any=1; }
+			((any)) || say list_none ;;
+		add)
+			local name=${1:-} src=${2:-} sha="" ltype
+			[[ $# -ge 2 ]] || die err_usage list
+			shift 2
+			while (($#)); do
+				case $1 in
+					--sha256) (($# >= 2)) || die err_usage list; sha=$2; shift 2 ;;
+					*) die err_unknown_opt "$1" ;;
+				esac
+			done
+			list_name_valid "$name" || die err_bad_listname "$name"
+			[[ -z $sha || $sha =~ ^[0-9A-Fa-f]{64}$ ]] || die err_bad_sha
+			[[ $src =~ ^[^[:space:]\']+$ ]] || die err_bad_source
+			need_root; take_lock; load_config
+			case $src in
+				https://*) ltype=url ;;
+				http://* | ftp://* | *://*) die err_https_only ;;
+				*)
+					src=$(readlink -f -- "$src") || die err_bad_source
+					[[ -f $src && -r $src ]] || die err_bad_source
+					ltype='file' ;;
+			esac
+			mkdir -p -- "$LISTS_D"
+			printf "type='%s'\nsource='%s'\nsha256='%s'\n" "$ltype" "$src" "$sha" | write_atomic "$LISTS_D/$name.conf"
+			say list_added "$name" ;;
+		update)
+			need_root; take_lock; load_config
+			mk_tmpdir
+			local names=() f n rc worst=0 changed=0 dht=0
+			if [[ -n ${1:-} ]]; then
+				if [[ $1 == dht ]]; then dht=1; else list_name_valid "$1" && [[ -e $LISTS_D/$1.conf ]] || die err_no_list "$1"; names=("$1"); fi
+			else
+				for f in "$LISTS_D"/*.conf; do [[ -e $f ]] && names+=("$(basename -- "$f" .conf)"); done
+				dht=1
+			fi
+			for n in "${names[@]+"${names[@]}"}"; do
+				list_update_one "$n"; rc=$?
+				((rc == 0)) && changed=1 || worst=1
+			done
+			if ((changed)) && [[ -n $FW ]] && fw_live; then sets_refresh list || worst=1; fi
+			if ((dht)); then
+				dht_update; rc=$?
+				if ((rc == 0)); then [[ -n $FW ]] && fw_live && { sets_refresh dht || worst=1; }; else worst=1; fi
+			fi
+			exit "$worst" ;;
+		rm)
+			[[ $# -eq 1 ]] || die err_usage list
+			list_name_valid "$1" && [[ -e $LISTS_D/$1.conf ]] || die err_no_list "$1"
+			need_root; take_lock; load_config
+			rm -f -- "$LISTS_D/$1.conf" "$CACHE_DIR/$1.list" "$CACHE_DIR/$1.meta"
+			[[ -n $FW ]] && fw_live && sets_refresh list
+			say list_removed "$1" ;;
+		*) die err_usage list ;;
+	esac
+}
+
+# Hidden helper: add one dynamic flow (the nDPId listener will use flow_add directly).
+cmd___flow_add() { # fam src sport dst dport proto [ttl]
+	[[ $# -ge 6 ]] || die err_usage __flow-add
+	need_root; take_lock; load_config require
+	local fam=$1 sip=$2 sp=$3 dip=$4 dp=$5 proto=$6 ttl=${7:-} l
+	[[ $fam == 4 || $fam == 6 ]] || die err_usage __flow-add
+	[[ $proto == tcp || $proto == udp ]] || die err_usage __flow-add
+	for l in "$sp" "$dp"; do
+		[[ $l =~ ^[0-9]{1,5}$ ]] && ((10#$l >= 1 && 10#$l <= 65535)) || die err_usage __flow-add
+	done
+	for l in "$sip" "$dip"; do
+		[[ $l != */* ]] && norm_entry "$l" >/dev/null && [[ $(fam_of "$l") == "$fam" ]] || die err_bad_entry "$l"
+	done
+	[[ -n $ttl ]] || ttl=$(dur2sec "${CFG[flow_ttl]}")
+	flow_add "$fam" "$sip" "$((10#$sp))" "$dip" "$((10#$dp))" "$proto" "$ttl" || die err_set_load flow
+}
+
+# Hidden helper: remove every bb object (what 'bb uninstall' will do).
+cmd___remove() {
+	need_root; take_lock; load_config require
+	fw_remove
+}
+
+usage() {
+	local topic=${1:-main}
+	if [[ -v MSG[help_$topic] ]]; then say "help_$topic"; else say help_main; fi
+}
+
+main() {
+	local args=() a
+	while (($#)); do
+		case $1 in
+			--lang) ARG_LANG=${2:-}; (($# >= 2)) && shift; shift ;;
+			--lang=*) ARG_LANG=${1#*=}; shift ;;
+			*) args+=("$1"); shift ;;
+		esac
+	done
+	set -- "${args[@]+"${args[@]}"}"
+	i18n_load en
+	cfg_load || true
+	if [[ -n $ARG_LANG && $ARG_LANG != en && $ARG_LANG != ru ]]; then die err_lang_invalid "$ARG_LANG"; fi
+	local lang
+	lang=$(effective_lang)
+	if [[ $lang == ru ]] && ! locale_is_utf8; then
+		raw_warn "Russian needs a UTF-8 terminal; using English for this run."
+		lang=en
+	fi
+	i18n_load "$lang"
+	local cmd=${1:-help}
+	[[ $# -gt 0 ]] && shift
+	for a in "$@"; do
+		if [[ $a == --help || $a == -h ]]; then usage "$cmd"; exit 0; fi
+	done
+	case $cmd in
+		help | --help | -h) usage main ;;
+		version | --version) say version "$BB_VERSION" ;;
+		apply) cmd_apply "$@" ;;
+		guard) cmd_guard "$@" ;;
+		ban) cmd_ban "$@" ;;
+		unban) cmd_unban "$@" ;;
+		allow) cmd_allow "$@" ;;
+		mode) cmd_mode "$@" ;;
+		lang) cmd_lang "$@" ;;
+		status) cmd_status "$@" ;;
+		list) cmd_list "$@" ;;
+		__init-config) cmd___init_config "$@" ;;
+		__flow-add) cmd___flow_add "$@" ;;
+		__remove) cmd___remove "$@" ;;
+		*) err err_unknown_cmd "$cmd"; usage main >&2; exit 1 ;;
+	esac
+}
+
+main "$@"
