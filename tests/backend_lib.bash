@@ -225,11 +225,13 @@ STUB
 
 t_mode_confirm_needs_timer() { # no systemd-run -> refuse to enter block mode at all
 	init_fw "$1"; bb apply
-	run env PATH="$R/empty:/usr/sbin:/usr/bin:/sbin:/bin" bash -c "command -v systemd-run" ; true
-	if command -v systemd-run >/dev/null; then skip "systemd-run exists here"; fi
-	run bb mode block --confirm 30
+	printf 'systemd-run\n' >"$R/absent"
+	printf '#!/bin/sh\nexit 127\n' >"$R/stubs/systemd-run"; chmod +x "$R/stubs/systemd-run"
+	BB_TEST_ABSENT_FILE=$R/absent PATH="$R/stubs:$PATH" run bb mode block --confirm 30
 	[ "$status" -ne 0 ]
+	[[ $output == *"systemd-run is required"* ]]
 	run bb mode; [[ $output == *monitor* ]]
+	assert_reach 198.51.100.2                  # and nothing is being dropped
 }
 
 t_bad_apply_keeps_state() { # a failing apply must leave the running rules intact

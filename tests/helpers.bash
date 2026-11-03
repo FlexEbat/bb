@@ -8,6 +8,7 @@ setup_root() {
 	R=$(mktemp -d)
 	export BB_TESTING=1 BB_CONF_DIR=$R/etc BB_STATE_DIR=$R/var BB_BACKUP_DIR=$R/bak
 	export BB_LOCK_FILE=$R/lock BB_SHARE_DIR=$R/share LANG=C.UTF-8 LC_ALL=C.UTF-8
+	export BB_UNIT_DIR=$R/units
 	mkdir -p "$R/share" "$R/stubs"
 	ln -s "$REPO/lang" "$R/share/lang"
 	ln -s "$REPO/src/net.awk" "$R/share/net.awk"
@@ -73,3 +74,6 @@ tcp_listen() { ip netns exec bbpeer nc -l -k "$1" >/dev/null 2>&1 & sleep 0.3; }
 tcp_ok() { nc -z -w2 -s 198.51.100.1 -p "$1" 198.51.100.2 "$2" 2>/dev/null; }
 
 status_count() { bb status | awk -v k="$1" '$1 == k { print $2 }'; }
+
+# "! cmd" never fails a bats test (negated commands are exempt from errexit).
+refute() { if "$@"; then echo "unexpected success: $*"; return 1; fi; }

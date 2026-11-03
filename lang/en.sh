@@ -88,6 +88,7 @@ MSG[help_main]="bb - lightweight blocker for BitTorrent, DHT and blocklists
 
 Usage: bb COMMAND [options]       (add --help to any command)
 
+  install / uninstall         set bb up (wizard) or remove everything it created
   apply                       rebuild the rules from the configuration
   status                      backend, mode, set sizes, counters
   mode monitor|block          switch mode (block --confirm N reverts if not confirmed)
@@ -125,3 +126,55 @@ Shows or changes the interface language."
 MSG[help_list]="Usage: bb list [add NAME URL|FILE [--sha256 HEX] | update [NAME|dht] | rm NAME]
 
 Without arguments shows the configured lists. Only https:// sources are accepted."
+
+MSG[err_check_failed]="the self-check failed:"
+MSG[err_install_failed]="installation failed; the rules were not changed"
+MSG[err_need_yes]="this is not a terminal: pass --yes to confirm"
+MSG[err_no_systemd]="systemd is required (use --force to continue without units)"
+MSG[err_os_unsupported]="unsupported distribution (ID=%s). Supported: Debian/Ubuntu (apt) and RHEL/Fedora (dnf). Needed: %s. Use --force to skip this check."
+MSG[err_pkg_install]="package installation failed; nothing was changed"
+MSG[err_pkg_still_missing]="the backend tools are still missing after installation: %s"
+MSG[err_ports_required]="--ports-mode only|except requires --ports"
+MSG[err_units]="could not install the systemd units"
+
+MSG[warn_check_dht_empty]="the DHT set is empty (DNS not working?); run 'bb list update dht' later"
+MSG[warn_mode_reverted]="block mode was never confirmed; reverted to monitor"
+MSG[warn_units_start]="could not start some units; check 'systemctl status bb-firewall'"
+MSG[inst_units_skipped]="systemd not available: units were not installed"
+
+MSG[chk_rules_inactive]="the rules are not active"
+MSG[chk_rules_missing]="no %s rules found"
+MSG[chk_set_missing]="set %s is missing"
+MSG[chk_stale_set]="stale temporary set %s"
+MSG[chk_unit_disabled]="unit %s is not enabled"
+
+MSG[inst_plan_pkgs]="Backend: %s. Will install: %s"
+MSG[inst_plan_none]="Backend: %s. Nothing to install."
+MSG[inst_pkg_installing]="Installing packages: %s"
+MSG[inst_prompt_iface]="Network interface to watch [%s]:"
+MSG[inst_prompt_mode]="Port mode: all, only or except [%s]:"
+MSG[inst_prompt_ports]="Ports, e.g. 6881-6889,51413 [%s]:"
+MSG[inst_backup]="Backup of the current state: %s"
+MSG[inst_backup_kept]="The backup was kept at %s"
+MSG[inst_allow_added]="Added to the allowlist: %s"
+MSG[inst_dpi_later]="Traffic inspection (nDPId) is not available in this version; using lists, DHT nodes and manual bans."
+MSG[inst_units]="systemd units installed and enabled."
+MSG[inst_check_ok]="Self-check passed."
+MSG[inst_done]="bb is installed in monitor mode (it logs and counts, nothing is dropped). Look at 'bb status', then run 'bb mode block --confirm 60'."
+
+MSG[uninst_confirm]="Remove all bb rules, sets and units? [y/N]"
+MSG[uninst_aborted]="Aborted."
+MSG[uninst_done]="bb removed. Configuration kept in %s (use --purge to delete it too)."
+MSG[uninst_purged]="bb removed completely."
+MSG[uninst_resaved]="Saved rules file %s no longer mentions bb."
+
+MSG[help_install]="Usage: bb install [--backend iptables|nft] [--iface IF] [--ports-mode all|only|except] [--ports LIST]
+                  [--no-dpi] [--yes] [--force]
+
+Checks the platform, installs missing packages, backs up the current rules, creates the sets
+and rules in monitor mode, fills the allowlist (gateway, DNS, your SSH address), installs the
+systemd units and verifies the result. On a terminal it asks the questions; --yes does not."
+MSG[help_uninstall]="Usage: bb uninstall [--yes] [--purge]
+
+Removes bb rules, sets and units. Other firewall rules are left alone and saved rule files
+are cleaned of bb entries. --purge also deletes the configuration and state."

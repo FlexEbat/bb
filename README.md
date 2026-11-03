@@ -7,12 +7,13 @@ A lightweight, CLI-only tool that blocks BitTorrent, DHT and blocklisted IP rang
 > Implemented so far (development order, section 17 of the spec): **step 1 core**
 > (backend abstraction for iptables+ipset and nft, sets and rules, `ban`/`unban`/`allow`,
 > `mode` with confirmation rollback, `apply`, `guard`, locking, EN/RU catalogs with parity
-> and lint checks), **step 2 static lists** (https-only download, strict validation,
-> private-range sanitizing, atomic replacement, shrink/empty protection, sha256) and
-> **step 3 DHT nodes**. Not yet: `bb install`/`uninstall`, systemd units and timers,
-> notifications, integrations, `bb doctor`, nDPId/listener, `--json`.
-> Until `bb install` exists, `make install` copies the files and `bb apply` needs a `bb.conf`
-> (see Development).
+> and lint checks), **step 2 static lists**, **step 3 DHT nodes** and **step 4 installer**
+> (`bb install` with platform check, package plan for apt/dnf, backup, allowlist auto-fill,
+> systemd units with ordering and hardening, self-check; `bb uninstall [--purge]` that only
+> removes bb objects and cleans saved rule files; an unconfirmed `block` mode is reverted
+> after a reboot).
+> Not yet: notifications, integrations, `bb doctor`, nDPId/listener, `--json`.
+> Install the files with `make install`, then run `sudo bb install`.
 
 ## Features
 

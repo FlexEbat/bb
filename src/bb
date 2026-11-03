@@ -25,13 +25,24 @@ if [[ ${BB_TESTING:-} == 1 ]]; then
 	SHARE_DIR=${BB_SHARE_DIR:?}
 	BACKUP_DIR=${BB_BACKUP_DIR:?}
 	LOCK_FILE=${BB_LOCK_FILE:?}
+	BIN_PATH=${BB_BIN_PATH:-/usr/local/sbin/bb}
+	UNIT_DIR=${BB_UNIT_DIR:?}
+	OS_RELEASE=${BB_OS_RELEASE:-/etc/os-release}
+	SAVED_RULE_FILES=${BB_SAVED_FILES:-}
+	RESOLV_FILES=${BB_RESOLV_FILES:-/etc/resolv.conf}
 else
 	CONF_DIR=/etc/bb
 	STATE_DIR=/var/lib/bb
 	SHARE_DIR=/usr/share/bb
 	BACKUP_DIR=/var/backups/bb
 	LOCK_FILE=/run/bb.lock
+	BIN_PATH=/usr/local/sbin/bb
+	UNIT_DIR=/etc/systemd/system
+	OS_RELEASE=/etc/os-release
+	SAVED_RULE_FILES="/etc/iptables/rules.v4 /etc/iptables/rules.v6 /etc/sysconfig/iptables /etc/sysconfig/ip6tables /etc/sysconfig/ipset /etc/iptables/ipsets"
+	RESOLV_FILES="/etc/resolv.conf /run/systemd/resolve/resolv.conf"
 fi
+PENDING_FILE=$STATE_DIR/mode.pending
 CONF_FILE=$CONF_DIR/bb.conf
 ALLOW_FILE=$CONF_DIR/allow.list
 MANUAL_FILE=$CONF_DIR/manual.list
@@ -91,7 +102,12 @@ log_event() { # stable English event tags for journald: log_event tag [k=v ...]
 	logger -t bb -- "$*" 2>/dev/null || true
 }
 
-have() { command -v "$1" >/dev/null 2>&1; }
+have() {
+	# Test hook: a file listing commands to pretend are not installed.
+	if [[ ${BB_TESTING:-} == 1 && -r ${BB_TEST_ABSENT_FILE:-/nonexistent} ]] &&
+		grep -qxF -- "$1" "$BB_TEST_ABSENT_FILE"; then return 1; fi
+	command -v "$1" >/dev/null 2>&1
+}
 
 cleanup() {
 	[[ -n $TMPD && -d $TMPD ]] && rm -rf -- "$TMPD"
@@ -169,7 +185,7 @@ cfg_defaults() {
 		[max_event_size]=1048576 [min_list_ratio]=50 [strip_private]=yes
 		[integrations]=auto [guard_interval]=300 [confirm_timeout]=60
 		[flow_rate_limit]=1000 [iface]='' [ports_mode]=all [ports]=''
-		[list_max_size]=268435456 [resolve_max]=5000
+		[list_max_size]=268435456 [resolve_max]=5000 [dpi]=no
 	)
 }
 
@@ -180,7 +196,7 @@ cfg_valid() { # key value
 		backend) [[ -z $v || $v == iptables || $v == nft ]] ;;
 		install_backend) [[ $v == iptables || $v == nft ]] ;;
 		mode) [[ $v == monitor || $v == block ]] ;;
-		ipv6 | strip_private) [[ $v == yes || $v == no ]] ;;
+		ipv6 | strip_private | dpi) [[ $v == yes || $v == no ]] ;;
 		hook_priority) [[ $v =~ ^-?[0-9]{1,5}$ ]] ;;
 		list_maxelem | flow_maxelem | flow_dedup | max_event_size | confirm_timeout | flow_rate_limit | list_max_size | resolve_max)
 			is_uint "$v" && ((v >= 1)) ;;
@@ -759,7 +775,8 @@ nft_status() {
 	for f in $(fw_families); do
 		for kind in allow manual list dht flow; do
 			name=$kind$f
-			n=$(nft list set inet bb "$name" 2>/dev/null | awk '
+			n=$(nft list set inet bb "$name" 2>/dev/null) || { printf 'set %s -\n' "$name"; continue; }
+			n=$(printf '%s\n' "$n" | awk '
 				/elements = \{/ { on = 1 }
 				on { s = s $0 }
 				on && /\}/ { on = 0 }
@@ -1034,6 +1051,19 @@ load_config() {
 
 fw_live() { [[ -n $FW ]] && fw_check >/dev/null 2>&1; }
 
+# A block mode that was never confirmed must not survive a reboot (the rollback
+# timer is transient). Called before apply/guard.
+mode_check_pending() {
+	[[ -e $PENDING_FILE ]] || return 0
+	if systemctl is-active --quiet bb-mode-rollback.timer 2>/dev/null; then return 0; fi
+	rm -f -- "$PENDING_FILE"
+	[[ ${CFG[mode]} == block ]] || return 0
+	CFG[mode]=monitor
+	cfg_save
+	warn warn_mode_reverted
+	log_event "mode_changed mode=monitor reason=unconfirmed"
+}
+
 # Rebuild everything from configuration; leaves the old state on failure.
 do_apply() {
 	local bdir=$BACKUP_DIR/last-apply
@@ -1055,6 +1085,7 @@ do_apply() {
 
 cmd_apply() {
 	need_root; take_lock; load_config require
+	mode_check_pending
 	do_apply || exit 1
 	say apply_done "${CFG[backend]}" "${CFG[mode]}"
 }
@@ -1063,6 +1094,7 @@ cmd_apply() {
 cmd_guard() {
 	need_root; take_lock; load_config require
 	fw_tools_ok || exit 1
+	mode_check_pending
 	fw_check && exit 0
 	log_event "guard_restored backend=${CFG[backend]}"
 	do_apply || exit 1
@@ -1196,6 +1228,7 @@ cmd_mode() {
 	case $want in
 		monitor | block) ;;
 		confirm)
+			rm -f -- "$PENDING_FILE"
 			if systemctl stop bb-mode-rollback.timer >/dev/null 2>&1; then say mode_confirmed; else say mode_nothing_pending; fi
 			return 0 ;;
 		'') say mode_current "${CFG[mode]}"; return 0 ;;
@@ -1209,14 +1242,17 @@ cmd_mode() {
 		systemctl stop bb-mode-rollback.timer >/dev/null 2>&1
 		systemd-run --quiet --collect --unit=bb-mode-rollback --on-active="${confirm}s" \
 			"$SELF" mode monitor --rollback >/dev/null 2>&1 || die err_rollback_arm
+		mkdir -p -- "$STATE_DIR"
+		date +%s | write_atomic "$PENDING_FILE"
 	elif [[ $want == monitor ]]; then
 		systemctl stop bb-mode-rollback.timer >/dev/null 2>&1
+		rm -f -- "$PENDING_FILE"
 	fi
 	local old=${CFG[mode]}
 	CFG[mode]=$want
 	if ! do_apply; then
 		CFG[mode]=$old
-		[[ -n $confirm ]] && systemctl stop bb-mode-rollback.timer >/dev/null 2>&1
+		[[ -n $confirm ]] && { systemctl stop bb-mode-rollback.timer >/dev/null 2>&1; rm -f -- "$PENDING_FILE"; }
 		exit 1
 	fi
 	cfg_save
@@ -1234,11 +1270,13 @@ cmd_mode() {
 			printf '%s ' "$(t mode_confirm_prompt)"
 			if read -r -t "$confirm" ans && [[ ${ans,,} == y || ${ans,,} == yes ]]; then
 				systemctl stop bb-mode-rollback.timer >/dev/null 2>&1
+				rm -f -- "$PENDING_FILE"
 				say mode_confirmed
 			else
 				printf '\n'
 				CFG[mode]=monitor
 				systemctl stop bb-mode-rollback.timer >/dev/null 2>&1
+				rm -f -- "$PENDING_FILE"
 				do_apply && cfg_save
 				say mode_rolled_back
 			fi
@@ -1375,6 +1413,480 @@ cmd___remove() {
 	fw_remove
 }
 
+# ---- install / uninstall -------------------------------------------------------
+OS_FAMILY="" OS_ID=""
+PLAN_BACKEND="" PLAN_PKGS=""
+UNIT_NAMES="bb-sets.service bb-firewall.service bb-update.service bb-update.timer bb-guard.service bb-guard.timer"
+
+os_info() { # sets OS_FAMILY (apt|dnf|unknown) and OS_ID
+	local line id="" like="" tok
+	OS_FAMILY=unknown OS_ID=""
+	[[ -r $OS_RELEASE ]] || return 0
+	while IFS= read -r line; do
+		case $line in
+			ID=*) id=${line#ID=} ;;
+			ID_LIKE=*) like=${line#ID_LIKE=} ;;
+		esac
+	done <"$OS_RELEASE"
+	id=${id//\"/} like=${like//\"/}
+	OS_ID=$id
+	for tok in $id $like; do
+		case $tok in
+			debian | ubuntu) OS_FAMILY=apt; return 0 ;;
+			rhel | fedora | centos | rocky | almalinux | ol) OS_FAMILY=dnf; return 0 ;;
+		esac
+	done
+}
+
+have_systemd() { [[ ${BB_TESTING:-} == 1 ]] || [[ -d /run/systemd/system ]]; }
+
+BASE_TOOLS="flock getent awk sed grep sort timeout logger"
+base_tools_missing() {
+	local c out=""
+	for c in $BASE_TOOLS; do have "$c" || out+=" $c"; done
+	printf '%s' "${out# }"
+}
+
+pkg_real() { # logical-name family -> distribution package name
+	case $1:$2 in
+		iproute2:dnf) printf 'iproute\n' ;;
+		iptables:dnf) printf 'iptables-nft\n' ;;
+		*) printf '%s\n' "$1" ;;
+	esac
+}
+
+backend_missing() { # backend -> logical packages that are not there yet
+	case $1 in
+		iptables) have iptables || printf 'iptables\n'; have ipset || printf 'ipset\n' ;;
+		nft) have nft || printf 'nftables\n' ;;
+	esac
+}
+
+# PLAN_BACKEND / PLAN_PKGS: what install is going to use and add.
+plan_install() { # [forced backend]
+	local want=${1:-} pkgs
+	if [[ -n $want ]]; then
+		PLAN_BACKEND=$want
+		pkgs=$(backend_missing "$want" | tr '\n' ' ')
+	else
+		detect_backend
+		PLAN_BACKEND=$DETECT_BACKEND
+		pkgs=$DETECT_PKGS
+	fi
+	have curl || have wget || pkgs+=" curl"
+	have ip || pkgs+=" iproute2"
+	PLAN_PKGS=$(printf '%s\n' $pkgs | awk 'NF && !seen[$0]++' | tr '\n' ' ')
+	PLAN_PKGS=${PLAN_PKGS% }
+}
+
+pkg_install() { # family logical...
+	local fam=$1 p
+	local -a real=()
+	shift
+	for p in "$@"; do real+=("$(pkg_real "$p" "$fam")"); done
+	case $fam in
+		apt) DEBIAN_FRONTEND=noninteractive apt-get install -y "${real[@]}" ;;
+		dnf) dnf install -y "${real[@]}" ;;
+		*) return 1 ;;
+	esac
+}
+
+# ---- allowlist auto-fill: gateway, DNS servers, the current SSH client ----------
+allow_autofill() { # prints the entries it added
+	local -a cand=()
+	local ip f line canon fam
+	if have ip; then
+		while read -r ip; do cand+=("$ip"); done < <(
+			{ ip -4 route show default; ip -6 route show default; } 2>/dev/null |
+				awk '{ for (i = 1; i < NF; i++) if ($i == "via") print $(i + 1) }')
+	fi
+	for f in $RESOLV_FILES; do
+		[[ -r $f ]] || continue
+		while read -r ip; do cand+=("$ip"); done < <(awk '$1 == "nameserver" { print $2 }' "$f")
+	done
+	line=${SSH_CONNECTION:-${SSH_CLIENT:-}}
+	[[ -n $line ]] && cand+=("${line%% *}")
+	for ip in "${cand[@]+"${cand[@]}"}"; do
+		ip=${ip%%%*} # drop an IPv6 zone ("fe80::1%eth0")
+		[[ $ip =~ ^127\. || $ip == ::1 ]] && continue
+		canon=$(norm_entry "$ip") || continue
+		fam=${canon%%$'\t'*} canon=${canon#*$'\t'}
+		[[ $fam == 6 && ${CFG[ipv6]} != yes ]] && continue
+		file_family "$ALLOW_FILE" "$fam" | grep -qxF -- "$canon" && continue
+		entry_file_put "$ALLOW_FILE" "$canon" "" && printf '%s\n' "$canon"
+	done
+}
+
+# ---- backups ---------------------------------------------------------------------
+install_backup() { # prints the directory
+	local d f
+	d=$BACKUP_DIR/install-$(date +%Y%m%d-%H%M%S)
+	mkdir -p -- "$d"
+	[[ -d $CONF_DIR ]] && cp -a -- "$CONF_DIR" "$d/etc-bb" 2>/dev/null
+	for f in "$UNIT_DIR"/bb-*.service "$UNIT_DIR"/bb-*.timer; do [[ -e $f ]] && cp -a -- "$f" "$d/" 2>/dev/null; done
+	have iptables-save && iptables-save >"$d/iptables.save" 2>/dev/null
+	have ip6tables-save && ip6tables-save >"$d/ip6tables.save" 2>/dev/null
+	have ipset && ipset save >"$d/ipset.save" 2>/dev/null
+	have nft && nft list ruleset >"$d/nft.ruleset" 2>/dev/null
+	for f in $SAVED_RULE_FILES; do [[ -r $f ]] && cp -a -- "$f" "$d/saved-$(basename -- "$f")" 2>/dev/null; done
+	printf '%s\n' "$d"
+}
+
+# ---- systemd units -----------------------------------------------------------------
+HARDEN='NoNewPrivileges=yes
+ProtectHome=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=-/etc/bb -/var/lib/bb -/var/backups/bb /run
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_DAC_OVERRIDE CAP_FOWNER CAP_CHOWN'
+
+unit_text() { # name
+	local bin=$BIN_PATH wants="" guard
+	guard=$(dur2sec "${CFG[guard_interval]}")
+	[[ ${CFG[backend]} == iptables ]] && wants="Wants=bb-sets.service"
+	case $1 in
+		bb-sets.service)
+			cat <<EOF
+[Unit]
+Description=bb: create firewall sets from the local cache
+DefaultDependencies=no
+After=local-fs.target systemd-modules-load.service
+Before=netfilter-persistent.service iptables.service ip6tables.service ufw.service network-pre.target shutdown.target
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=$bin __sets-restore
+$HARDEN
+
+[Install]
+WantedBy=sysinit.target
+EOF
+			;;
+		bb-firewall.service)
+			cat <<EOF
+[Unit]
+Description=bb: apply blocking rules
+After=nftables.service netfilter-persistent.service iptables.service ip6tables.service ufw.service network-pre.target
+Before=docker.service k3s.service
+$wants
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=$bin apply
+$HARDEN
+
+[Install]
+WantedBy=multi-user.target
+EOF
+			;;
+		bb-update.service)
+			cat <<EOF
+[Unit]
+Description=bb: update blocklists and DHT nodes
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$bin list update
+$HARDEN
+EOF
+			;;
+		bb-update.timer)
+			cat <<EOF
+[Unit]
+Description=bb: daily list update
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+			;;
+		bb-guard.service)
+			cat <<EOF
+[Unit]
+Description=bb: make sure the rules are still in place
+
+[Service]
+Type=oneshot
+ExecStart=$bin guard
+$HARDEN
+EOF
+			;;
+		bb-guard.timer)
+			cat <<EOF
+[Unit]
+Description=bb: periodic rule guard
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=${guard}s
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target
+EOF
+			;;
+		*) return 1 ;;
+	esac | awk 'NF || prev { print } { prev = NF }' # drop the blank line an empty $wants leaves
+}
+
+units_install() {
+	local u tmp
+	mkdir -p -- "$UNIT_DIR" || return 1
+	for u in $UNIT_NAMES; do
+		[[ $u == bb-sets.service && ${CFG[backend]} != iptables ]] && continue
+		tmp=$UNIT_DIR/$u.new
+		unit_text "$u" >"$tmp" && chmod 0644 "$tmp" && mv -f -- "$tmp" "$UNIT_DIR/$u" || return 1
+	done
+	[[ ${CFG[backend]} == iptables ]] || rm -f -- "$UNIT_DIR/bb-sets.service"
+	systemctl daemon-reload >/dev/null 2>&1 || true
+	systemctl enable bb-firewall.service bb-update.timer bb-guard.timer >/dev/null 2>&1 || return 1
+	[[ ${CFG[backend]} == iptables ]] && { systemctl enable bb-sets.service >/dev/null 2>&1 || return 1; }
+	return 0
+}
+
+# ---- self-check: prints one problem per line -----------------------------------------
+selfcheck() {
+	local out kind a b c u s
+	if ! fw_check >/dev/null 2>&1; then t chk_rules_inactive; printf '\n'; fi
+	out=$(fw_status 2>/dev/null)
+	while read -r kind a b c; do
+		[[ $kind == set && $b == - ]] && { t chk_set_missing "$a"; printf '\n'; }
+	done <<<"$out"
+	for s in dht flow; do
+		grep -q "^counter $s " <<<"$out" || { t chk_rules_missing "$s"; printf '\n'; }
+	done
+	if have ipset; then
+		for s in $(ipset list -n 2>/dev/null | grep '^bb_tmp_'); do t chk_stale_set "$s"; printf '\n'; done
+	fi
+	for u in bb-firewall.service bb-update.timer bb-guard.timer; do
+		systemctl is-enabled --quiet "$u" 2>/dev/null || { t chk_unit_disabled "$u"; printf '\n'; }
+	done
+	[[ ${CFG[backend]} == iptables ]] && { systemctl is-enabled --quiet bb-sets.service 2>/dev/null || { t chk_unit_disabled bb-sets.service; printf '\n'; }; }
+	return 0
+}
+
+ask() { # prompt default -> answer on stdout
+	local ans=""
+	read -r -p "$1" ans
+	printf '%s\n' "${ans:-$2}"
+}
+
+install_choose_lang() { # $1 = interactive (0/1)
+	local lang=${ARG_LANG:-} def ans
+	if [[ -z $lang ]]; then
+		lang=${CFG[lang]}
+		if (($1)); then
+			def=en
+			[[ ${LC_ALL:-${LANG:-}} == ru* ]] && def=ru
+			printf 'Language / Язык: 1) English  2) Русский [%s]: ' "$def" >&2 # bb-lint: ok
+			read -r ans
+			case $ans in 1) lang=en ;; 2) lang=ru ;; *) lang=$def ;; esac
+		fi
+	fi
+	if [[ $lang == ru ]] && ! locale_is_utf8; then
+		raw_warn "Russian needs a UTF-8 terminal; installing with English."
+		lang=en
+	fi
+	CFG[lang]=$lang
+	i18n_load "$lang"
+}
+
+cmd_install() {
+	local want="" iface="" pmode="" ports="" yes=0 force=0 nodpi=0 inter=0 def
+	while (($#)); do
+		case $1 in
+			--backend) want=${2:-}; (($# >= 2)) || die err_usage install; shift 2 ;;
+			--iface) iface=${2:-}; (($# >= 2)) || die err_usage install; shift 2 ;;
+			--ports-mode) pmode=${2:-}; (($# >= 2)) || die err_usage install; shift 2 ;;
+			--ports) ports=${2:-}; (($# >= 2)) || die err_usage install; shift 2 ;;
+			--yes | -y) yes=1; shift ;;
+			--force) force=1; shift ;;
+			--no-dpi) nodpi=1; shift ;;
+			*) die err_unknown_opt "$1" ;;
+		esac
+	done
+	need_root; take_lock
+	cfg_load || true
+	((yes == 0)) && [[ -t 0 && -t 1 ]] && inter=1
+	install_choose_lang "$inter"
+
+	# argument validation happens before anything is touched
+	[[ -z $want ]] || cfg_valid backend "$want" || die err_cfg_invalid backend "$want"
+	[[ -z $pmode ]] || cfg_valid ports_mode "$pmode" || die err_cfg_invalid ports_mode "$pmode"
+	[[ -z $ports ]] || ports_valid "$ports" || die err_cfg_invalid ports "$ports"
+	[[ -z $iface ]] || cfg_valid iface "$iface" || die err_cfg_invalid iface "$iface"
+	if [[ $pmode == only || $pmode == except ]] && [[ -z $ports ]]; then die err_ports_required; fi
+
+	# 1. platform
+	os_info
+	if [[ $OS_FAMILY == unknown ]] && ((force == 0)); then die err_os_unsupported "${OS_ID:-?}" "$BASE_TOOLS"; fi
+	if ! have_systemd && ((force == 0)); then die err_no_systemd; fi
+	local missing
+	missing=$(base_tools_missing)
+	[[ -z $missing ]] || die err_tools_missing "$missing"
+
+	# 2. plan, then packages (nothing on the system has changed up to here)
+	plan_install "$want"
+	if [[ -n $PLAN_PKGS ]]; then
+		say inst_plan_pkgs "$PLAN_BACKEND" "$PLAN_PKGS"
+		[[ $OS_FAMILY != unknown ]] || die err_os_unsupported "${OS_ID:-?}" "$PLAN_PKGS"
+		say inst_pkg_installing "$PLAN_PKGS"
+		# shellcheck disable=SC2086
+		pkg_install "$OS_FAMILY" $PLAN_PKGS || die err_pkg_install
+		missing=$(backend_missing "$PLAN_BACKEND" | tr '\n' ' ')
+		[[ -z ${missing// /} ]] || die err_pkg_still_missing "$missing"
+	else
+		say inst_plan_none "$PLAN_BACKEND"
+	fi
+
+	# 3. wizard / flags
+	def=$iface
+	if [[ -z $def ]]; then
+		def=${CFG[iface]}
+		[[ -n $def ]] || def=$(ip route show default 2>/dev/null | awk '{ for (i = 1; i < NF; i++) if ($i == "dev") { print $(i + 1); exit } }')
+	fi
+	if ((inter)); then
+		[[ -n $iface ]] || iface=$(ask "$(t inst_prompt_iface "$def") " "$def")
+		[[ -n $pmode ]] || pmode=$(ask "$(t inst_prompt_mode "${CFG[ports_mode]}") " "${CFG[ports_mode]}")
+		if [[ $pmode != all && -z $ports ]]; then ports=$(ask "$(t inst_prompt_ports "${CFG[ports]}") " "${CFG[ports]}"); fi
+	else
+		[[ -n $iface ]] || iface=$def
+	fi
+	[[ -n $pmode ]] || pmode=${CFG[ports_mode]}
+	[[ $pmode == all || -n $ports ]] || ports=${CFG[ports]}
+	cfg_valid iface "$iface" || die err_cfg_invalid iface "$iface"
+	cfg_valid ports_mode "$pmode" || die err_cfg_invalid ports_mode "$pmode"
+	if [[ $pmode != all ]]; then ports_valid "$ports" || die err_cfg_invalid ports "$ports"; else ports=""; fi
+
+	# 4. backup, configuration, allowlist, sets and rules (monitor mode)
+	local bdir
+	bdir=$(install_backup)
+	say inst_backup "$bdir"
+	CFG[backend]=$PLAN_BACKEND
+	CFG[iface]=$iface CFG[ports_mode]=$pmode CFG[ports]=$ports
+	CFG[mode]=monitor
+	((nodpi)) && CFG[dpi]=no
+	if [[ -s /proc/net/if_inet6 ]]; then CFG[ipv6]=yes; else CFG[ipv6]=no; fi
+	[[ -n ${BB_FORCE_IPV6:-} && ${BB_TESTING:-} == 1 ]] && CFG[ipv6]=$BB_FORCE_IPV6
+	mkdir -p -- "$LISTS_D" "$STATE_DIR" "$BACKUP_DIR" || die err_mkdir "$CONF_DIR"
+	cfg_save
+	[[ -e $MANUAL_FILE ]] || : >"$MANUAL_FILE"
+	[[ -e $ALLOW_FILE ]] || : >"$ALLOW_FILE"
+	local added
+	added=$(allow_autofill | tr '\n' ' ')
+	[[ -z $added ]] || say inst_allow_added "${added% }"
+	fw_select
+	dht_update || true # best effort: DNS may not work yet
+	if ! do_apply; then
+		err err_install_failed
+		say inst_backup_kept "$bdir"
+		exit 1
+	fi
+	((nodpi)) || say inst_dpi_later
+
+	# 5. units
+	if have_systemd; then
+		units_install || { err err_units; say inst_backup_kept "$bdir"; exit 1; }
+		say inst_units
+	else
+		warn inst_units_skipped
+	fi
+
+	# 6. verification
+	local problems
+	problems=$(selfcheck | awk 'NF')
+	if [[ -n $problems ]]; then
+		err err_check_failed
+		printf '%s\n' "$problems" | sed 's/^/  - /'
+		say inst_backup_kept "$bdir"
+		exit 1
+	fi
+	[[ -s $DHT_CACHE ]] || warn warn_check_dht_empty
+	rm -rf -- "$BACKUP_DIR"/install-*
+	log_event "install backend=$PLAN_BACKEND mode=monitor"
+	say inst_check_ok
+	# Start the oneshot units only now, with our lock released (they run bb themselves).
+	exec 9>&-
+	if have_systemd; then
+		systemctl start bb-firewall.service bb-update.timer bb-guard.timer >/dev/null 2>&1 || warn warn_units_start
+	fi
+	say inst_done
+}
+
+# Remove every line that mentions bb objects from a saved-rules file.
+strip_saved_file() {
+	local f=$1 tmp
+	[[ -f $f && -r $f ]] || return 0
+	grep -qE 'BB_FILTER|(^| )bb_[a-z]' "$f" || return 0
+	tmp=$f.bb-new
+	awk '/BB_FILTER/ { next } $2 ~ /^bb_/ { next } { print }' "$f" >"$tmp" || { rm -f -- "$tmp"; return 1; }
+	chmod --reference="$f" "$tmp" 2>/dev/null
+	chown --reference="$f" "$tmp" 2>/dev/null
+	mv -f -- "$tmp" "$f" || return 1
+	say uninst_resaved "$f"
+}
+
+safe_rm_dir() { [[ -n $1 && $1 != / && $1 == /?* ]] && rm -rf -- "$1"; }
+
+cmd_uninstall() {
+	local yes=0 purge=0 u ans=""
+	while (($#)); do
+		case $1 in
+			--yes | -y) yes=1; shift ;;
+			--purge) purge=1; shift ;;
+			*) die err_unknown_opt "$1" ;;
+		esac
+	done
+	need_root; take_lock; cfg_load || true
+	if ((yes == 0)); then
+		[[ -t 0 && -t 1 ]] || die err_need_yes
+		printf '%s ' "$(t uninst_confirm)"
+		read -r ans
+		[[ ${ans,,} == y || ${ans,,} == yes ]] || { say uninst_aborted; exit 1; }
+	fi
+	for u in bb-mode-rollback.timer bb-guard.timer bb-update.timer bb-firewall.service bb-sets.service bb-guard.service bb-update.service; do
+		systemctl stop "$u" >/dev/null 2>&1
+		systemctl disable "$u" >/dev/null 2>&1
+	done
+	for u in $UNIT_NAMES; do rm -f -- "$UNIT_DIR/$u" "$UNIT_DIR/$u.new"; done
+	systemctl daemon-reload >/dev/null 2>&1
+	# Only bb objects go; everything else in the firewall stays as it was.
+	have iptables && ipt_remove
+	have nft && nft_remove
+	for u in $SAVED_RULE_FILES; do strip_saved_file "$u"; done
+	rm -f -- "$PENDING_FILE"
+	log_event "uninstall purge=$purge"
+	if ((purge)); then
+		safe_rm_dir "$CONF_DIR"; safe_rm_dir "$STATE_DIR"; safe_rm_dir "$BACKUP_DIR"
+		TMPD=""
+		if [[ ${BB_TESTING:-} != 1 ]]; then safe_rm_dir "$SHARE_DIR"; rm -f -- "$BIN_PATH"; fi
+		say uninst_purged
+	else
+		say uninst_done "$CONF_DIR"
+	fi
+}
+
+cmd___sets_restore() { # boot-time: sets only, before any other firewall service
+	need_root; take_lock; load_config require
+	fw_tools_ok || exit 1
+	mk_tmpdir
+	fw_init && sets_load_all
+}
+
+cmd___unit() { # print a unit file (debugging and tests)
+	cfg_load || true
+	unit_text "${1:-}" || die err_usage __unit
+}
+
 usage() {
 	local topic=${1:-main}
 	if [[ -v MSG[help_$topic] ]]; then say "help_$topic"; else say help_main; fi
@@ -1420,6 +1932,10 @@ main() {
 		__init-config) cmd___init_config "$@" ;;
 		__flow-add) cmd___flow_add "$@" ;;
 		__remove) cmd___remove "$@" ;;
+		__sets-restore) cmd___sets_restore "$@" ;;
+		__unit) cmd___unit "$@" ;;
+		install) cmd_install "$@" ;;
+		uninstall) cmd_uninstall "$@" ;;
 		*) err err_unknown_cmd "$cmd"; usage main >&2; exit 1 ;;
 	esac
 }

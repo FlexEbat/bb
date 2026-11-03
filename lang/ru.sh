@@ -87,6 +87,7 @@ MSG[help_main]="bb - лёгкий блокировщик BitTorrent, DHT и чё
 
 Использование: bb КОМАНДА [параметры]       (у каждой команды есть --help)
 
+  install / uninstall         установить bb (мастер) или удалить всё, что он создал
   apply                       пересобрать правила из конфигурации
   status                      бэкенд, режим, размеры наборов, счётчики
   mode monitor|block          сменить режим (block --confirm N откатится без подтверждения)
@@ -124,3 +125,55 @@ MSG[help_lang]="Использование: bb lang [en|ru]
 MSG[help_list]="Использование: bb list [add ИМЯ URL|ФАЙЛ [--sha256 HEX] | update [ИМЯ|dht] | rm ИМЯ]
 
 Без аргументов показывает настроенные списки. Принимаются только источники https://."
+
+MSG[err_check_failed]="самопроверка не пройдена:"
+MSG[err_install_failed]="установка не удалась; правила не изменены"
+MSG[err_need_yes]="это не терминал: подтвердите параметром --yes"
+MSG[err_no_systemd]="требуется systemd (с параметром --force можно продолжить без юнитов)"
+MSG[err_os_unsupported]="дистрибутив не поддерживается (ID=%s). Поддерживаются Debian/Ubuntu (apt) и RHEL/Fedora (dnf). Нужно: %s. Параметр --force пропускает эту проверку."
+MSG[err_pkg_install]="не удалось установить пакеты; ничего не изменено"
+MSG[err_pkg_still_missing]="после установки утилиты бэкенда всё ещё отсутствуют: %s"
+MSG[err_ports_required]="для --ports-mode only|except нужен параметр --ports"
+MSG[err_units]="не удалось установить юниты systemd"
+
+MSG[warn_check_dht_empty]="набор DHT пуст (не работает DNS?); позже выполните «bb list update dht»"
+MSG[warn_mode_reverted]="режим block не был подтверждён; выполнен возврат в monitor"
+MSG[warn_units_start]="не удалось запустить часть юнитов; смотрите «systemctl status bb-firewall»"
+MSG[inst_units_skipped]="systemd недоступен: юниты не установлены"
+
+MSG[chk_rules_inactive]="правила не активны"
+MSG[chk_rules_missing]="не найдены правила %s"
+MSG[chk_set_missing]="набор %s отсутствует"
+MSG[chk_stale_set]="остался временный набор %s"
+MSG[chk_unit_disabled]="юнит %s не включён"
+
+MSG[inst_plan_pkgs]="Бэкенд: %s. Будут установлены: %s"
+MSG[inst_plan_none]="Бэкенд: %s. Устанавливать нечего."
+MSG[inst_pkg_installing]="Установка пакетов: %s"
+MSG[inst_prompt_iface]="Сетевой интерфейс для наблюдения [%s]:"
+MSG[inst_prompt_mode]="Режим портов: all, only или except [%s]:"
+MSG[inst_prompt_ports]="Порты, например 6881-6889,51413 [%s]:"
+MSG[inst_backup]="Резервная копия текущего состояния: %s"
+MSG[inst_backup_kept]="Резервная копия сохранена: %s"
+MSG[inst_allow_added]="Добавлено в список исключений: %s"
+MSG[inst_dpi_later]="Анализ трафика (nDPId) в этой версии недоступен; используются списки, DHT-узлы и ручные блокировки."
+MSG[inst_units]="Юниты systemd установлены и включены."
+MSG[inst_check_ok]="Самопроверка пройдена."
+MSG[inst_done]="bb установлен в режиме monitor (пишет в журнал и считает, ничего не отбрасывает). Посмотрите «bb status», затем выполните «bb mode block --confirm 60»."
+
+MSG[uninst_confirm]="Удалить все правила, наборы и юниты bb? [y/N]"
+MSG[uninst_aborted]="Отменено."
+MSG[uninst_done]="bb удалён. Конфигурация сохранена в %s (чтобы удалить и её, используйте --purge)."
+MSG[uninst_purged]="bb удалён полностью."
+MSG[uninst_resaved]="Файл сохранённых правил %s больше не упоминает bb."
+
+MSG[help_install]="Использование: bb install [--backend iptables|nft] [--iface ИНТЕРФЕЙС] [--ports-mode all|only|except] [--ports СПИСОК]
+                       [--no-dpi] [--yes] [--force]
+
+Проверяет платформу, ставит недостающие пакеты, делает резервную копию текущих правил, создаёт наборы
+и правила в режиме monitor, заполняет список исключений (шлюз, DNS, ваш SSH-адрес), устанавливает
+юниты systemd и проверяет результат. В терминале задаёт вопросы; с --yes не спрашивает."
+MSG[help_uninstall]="Использование: bb uninstall [--yes] [--purge]
+
+Удаляет правила, наборы и юниты bb. Остальные правила межсетевого экрана не затрагиваются,
+из файлов сохранённых правил убираются записи bb. С --purge удаляются также конфигурация и состояние."
