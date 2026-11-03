@@ -12,6 +12,7 @@ A lightweight, CLI-only tool that blocks BitTorrent, DHT and blocklisted IP rang
 - **Optional DPI layer:** [nDPId](https://github.com/utoni/nDPId) detects BitTorrent flows and a small bash listener (parsing events with `jq`) adds them to a set with a TTL.
 - **Notifications:** optional Telegram and Matrix alerts (mode changes, failed or rejected list updates, guard restores, service failures, daily digest), sent with plain `curl`.
 - **Safe by default:** starts in `monitor` mode (log and count, no dropping), keeps backups, rolls back on errors and refuses to apply empty or suspiciously shrunk lists.
+- **English or Russian interface:** the language is chosen at install time and applies to everything you see (wizard, output, errors, `--help`, notifications). It can be changed later with `bb lang`.
 - **Plays well with others:** works alongside Docker, k3s/k8s, ufw and firewalld without touching their rules.
 
 ## How it works
@@ -55,11 +56,11 @@ sudo bb notify test
 ## Commands
 
 ```
-bb install [--backend iptables|nft] [--iface IFACE] [--ports-mode only|all|except]
+bb install [--lang en|ru] [--backend iptables|nft] [--iface IFACE] [--ports-mode only|all|except]
            [--ports LIST] [--no-dpi] [--yes]
-bb migrate                    migrate from BitBlocker
 bb status [--json]            bb doctor [--json]
 bb apply                      bb log -f
+bb lang [en|ru]               show or change the interface language
 bb list add|update|rm         bb show flows
 bb ban <ip|net> [--ttl 7d]    bb unban <ip|net>
 bb allow <ip|net>             bb integrate auto|docker|k8s|ufw|firewalld|status
