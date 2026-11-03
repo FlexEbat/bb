@@ -55,7 +55,9 @@ sudo bb notify test
 ## Commands
 
 ```
-bb install [--backend iptables|nft] [--iface IFACE] [--ports RANGE] [--no-dpi]
+bb install [--backend iptables|nft] [--iface IFACE] [--ports-mode only|all|except]
+           [--ports LIST] [--no-dpi] [--yes]
+bb migrate                    migrate from BitBlocker
 bb status [--json]            bb doctor [--json]
 bb apply                      bb log -f
 bb list add|update|rm         bb show flows
