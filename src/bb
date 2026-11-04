@@ -30,6 +30,11 @@ if [[ ${BB_TESTING:-} == 1 ]]; then
 	OS_RELEASE=${BB_OS_RELEASE:-/etc/os-release}
 	SAVED_RULE_FILES=${BB_SAVED_FILES:-}
 	RESOLV_FILES=${BB_RESOLV_FILES:-/etc/resolv.conf}
+	K3S_DIR=${BB_K3S_DIR:-/nonexistent/k3s}
+	KUBE_MANIFEST_DIR=${BB_KUBE_MANIFEST_DIR:-/nonexistent/manifests}
+	UFW_CONF=${BB_UFW_CONF:-/nonexistent/ufw.conf}
+	FIREWALLD_CONF=${BB_FIREWALLD_CONF:-/nonexistent/firewalld.conf}
+	NFTABLES_CONF=${BB_NFTABLES_CONF:-/nonexistent/nftables.conf}
 else
 	CONF_DIR=/etc/bb
 	STATE_DIR=/var/lib/bb
@@ -41,6 +46,11 @@ else
 	OS_RELEASE=/etc/os-release
 	SAVED_RULE_FILES="/etc/iptables/rules.v4 /etc/iptables/rules.v6 /etc/sysconfig/iptables /etc/sysconfig/ip6tables /etc/sysconfig/ipset /etc/iptables/ipsets"
 	RESOLV_FILES="/etc/resolv.conf /run/systemd/resolve/resolv.conf"
+	K3S_DIR=/etc/rancher/k3s
+	KUBE_MANIFEST_DIR=/etc/kubernetes/manifests
+	UFW_CONF=/etc/ufw/ufw.conf
+	FIREWALLD_CONF=/etc/firewalld/firewalld.conf
+	NFTABLES_CONF=/etc/nftables.conf
 fi
 PENDING_FILE=$STATE_DIR/mode.pending
 NOTIFY_CONF=$CONF_DIR/notify.conf
@@ -52,6 +62,8 @@ NOTIFY_LOCK=$STATE_DIR/notify.lock
 NOTIFY_FLUSH_LOCK=$STATE_DIR/notify.flush.lock
 NOTIFY_ALLOW_FILE=$STATE_DIR/notify.allow
 DIGEST_SNAP=$STATE_DIR/digest.counters
+INTEG_INTERNAL=$STATE_DIR/integrations.internal
+INTEG_ALLOW=$STATE_DIR/integrations.allow
 CONF_FILE=$CONF_DIR/bb.conf
 ALLOW_FILE=$CONF_DIR/allow.list
 MANUAL_FILE=$CONF_DIR/manual.list
@@ -150,6 +162,24 @@ dur2sec() {
 	printf '%d\n' "$n"
 }
 
+# integrations: auto | none | comma list of docker,k8s,ufw,firewalld
+integrations_valid() {
+	local e
+	[[ $1 == auto || $1 == none ]] && return 0
+	[[ -n $1 ]] || return 1
+	local IFS=,
+	for e in $1; do
+		[[ $e == docker || $e == k8s || $e == ufw || $e == firewalld ]] || return 1
+	done
+}
+
+cidr_list_valid() { # comma list of IPs/networks, may be empty
+	local e
+	[[ -z $1 ]] && return 0
+	local IFS=,
+	for e in $1; do norm_entry "$e" >/dev/null || return 1; done
+}
+
 is_uint() { [[ $1 =~ ^[0-9]{1,12}$ ]]; }
 
 # Port list "6881-6889,51413": numbers 1-65535, ranges ascending,
@@ -200,6 +230,7 @@ cfg_defaults() {
 		[notify_events]='mode_changed,guard_restored,list_update_failed,list_rejected,service_failed,rate_limit'
 		[notify_dedup]=30m [notify_rate_limit]=20 [notify_queue_ttl]=24h [notify_queue_max]=200
 		[notify_allow]=yes [notify_proxy]='' [notify_lang]=''
+		[k8s_pod_cidr]='' [k8s_service_cidr]=''
 	)
 }
 
@@ -221,7 +252,8 @@ cfg_valid() { # key value
 			is_uint "$v" && ((v >= 1)) ;;
 		flow_ttl | guard_interval) dur2sec "$v" >/dev/null ;;
 		min_list_ratio) is_uint "$v" && ((v <= 100)) ;;
-		integrations) [[ $v =~ ^[a-z0-9,]{1,64}$ ]] ;;
+		integrations) integrations_valid "$v" ;;
+		k8s_pod_cidr | k8s_service_cidr) cidr_list_valid "$v" ;;
 		iface) [[ -z $v || $v =~ ^[A-Za-z0-9_.:@-]{1,64}$ ]] ;;
 		ports_mode) [[ $v == only || $v == all || $v == except ]] ;;
 		ports) [[ -z $v ]] || ports_valid "$v" ;;
@@ -355,10 +387,9 @@ fw_select() { # sets FW from bb.conf
 	esac
 }
 
-fw_tools_ok() {
-	local missing=""
+fw_missing_list() { # prints the missing tool names, space separated
+	local c missing=""
 	if [[ $FW == ipt ]]; then
-		local c
 		for c in iptables iptables-restore iptables-save ipset; do have "$c" || missing+=" $c"; done
 		if [[ ${CFG[ipv6]} == yes ]]; then
 			for c in ip6tables ip6tables-restore ip6tables-save; do have "$c" || missing+=" $c"; done
@@ -366,7 +397,13 @@ fw_tools_ok() {
 	else
 		have nft || missing+=" nft"
 	fi
-	[[ -z $missing ]] || { err err_tools_missing "${missing# }"; return 1; }
+	printf '%s' "${missing# }"
+}
+
+fw_tools_ok() {
+	local missing
+	missing=$(fw_missing_list)
+	[[ -z $missing ]] || { err err_tools_missing "$missing"; return 1; }
 }
 
 # Dispatchers.
@@ -404,7 +441,7 @@ ipt_set_args() { # kind fam [count]
 	local kind=$1 fam=$2 count=${3:-0} f=inet
 	[[ $fam == 6 ]] && f=inet6
 	case $kind in
-		allow) printf 'hash:net family %s maxelem 65536 hashsize 1024\n' "$f" ;;
+		allow | internal) printf 'hash:net family %s maxelem 65536 hashsize 1024\n' "$f" ;;
 		manual) printf 'hash:net family %s maxelem 65536 hashsize 1024 timeout 0\n' "$f" ;;
 		list) printf 'hash:net family %s maxelem %s hashsize %s\n' "$f" "${CFG[list_maxelem]}" "$(ipt_hashsize "$count")" ;;
 		dht) printf 'hash:ip,port family %s maxelem 65536 hashsize 1024\n' "$f" ;;
@@ -416,7 +453,7 @@ ipt_set_args() { # kind fam [count]
 ipt_init() {
 	local f kind name
 	for f in $(fw_families); do
-		for kind in allow manual list dht flow_src flow_dst; do
+		for kind in allow internal manual list dht flow_src flow_dst; do
 			name=$(ipt_set "$kind" "$f")
 			# shellcheck disable=SC2046
 			ipset create -exist "$name" $(ipt_set_args "$kind" "$f") 2>/dev/null ||
@@ -452,6 +489,8 @@ ipt_rules() { # fam -> iptables-restore input (one atomic transaction)
 	for d in src dst; do
 		printf -- '-A BB_FILTER -m set --match-set bb_allow%s %s -j RETURN\n' "$f" "$d"
 	done
+	# integration networks (containers, pods): exempt only when BOTH ends are internal
+	printf -- '-A BB_FILTER -m set --match-set bb_internal%s src -m set --match-set bb_internal%s dst -j RETURN\n' "$f" "$f"
 	for d in src dst; do ipt_emit manual "-m set --match-set bb_manual$f $d"; done
 	for d in src dst; do ipt_emit list "-m set --match-set bb_list$f $d"; done
 	mp=$(ipt_port_match)
@@ -587,7 +626,7 @@ ipt_flow_add() { # fam src sport dst dport proto ttl
 ipt_status() {
 	local f bin kind name n
 	for f in $(fw_families); do
-		for kind in allow manual list dht flow_src flow_dst; do
+		for kind in allow internal manual list dht flow_src flow_dst; do
 			name=$(ipt_set "$kind" "$f")
 			n=$(ipset list -t "$name" 2>/dev/null | awk -F': ' '/^Number of entries/ { print $2 }')
 			printf 'set %s %s\n' "${kind}${f}" "${n:--}"
@@ -642,6 +681,7 @@ nft_structure() { # idempotent definition of table, sets and chains
 	for f in $(fw_families); do
 		a=$(nft_atype "$f")
 		printf 'add set inet bb allow%s { type %s; flags interval; auto-merge; }\n' "$f" "$a"
+		printf 'add set inet bb internal%s { type %s; flags interval; auto-merge; }\n' "$f" "$a"
 		printf 'add set inet bb manual%s { type %s; flags interval,timeout; auto-merge; }\n' "$f" "$a"
 		printf 'add set inet bb list%s { type %s; flags interval; auto-merge; }\n' "$f" "$a"
 		printf 'add set inet bb dht%s { type %s . inet_service; }\n' "$f" "$a"
@@ -698,6 +738,7 @@ nft_rules() {
 		ip=ip
 		[[ $f == 6 ]] && ip=ip6
 		for dir in saddr daddr; do printf 'add rule inet bb bb_main %s %s @allow%s return\n' "$ip" "$dir" "$f"; done
+		printf 'add rule inet bb bb_main %s saddr @internal%s %s daddr @internal%s return\n' "$ip" "$f" "$ip" "$f"
 		for dir in saddr daddr; do nft_emit manual "$ip $dir @manual$f"; done
 		for dir in saddr daddr; do nft_emit list "$ip $dir @list$f"; done
 		# DHT: the port mode lives in the bb_dht sub-chain. Chained "!=" on adjacent
@@ -792,7 +833,7 @@ nft_flow_add() { # fam src sport dst dport proto ttl
 nft_status() {
 	local f kind name n
 	for f in $(fw_families); do
-		for kind in allow manual list dht flow; do
+		for kind in allow internal manual list dht flow; do
 			name=$kind$f
 			n=$(nft list set inet bb "$name" 2>/dev/null) || { printf 'set %s -\n' "$name"; continue; }
 			n=$(printf '%s\n' "$n" | awk '
@@ -867,6 +908,8 @@ sets_load_all() {
 	for f in $(fw_families); do
 		allow_union "$f" >"$TMPD/allow.$f"
 		set_replace allow "$f" "$TMPD/allow.$f" || { err err_set_load "allow$f"; rc=1; }
+		file_family "$INTEG_INTERNAL" "$f" >"$TMPD/internal.$f"
+		set_replace internal "$f" "$TMPD/internal.$f" || { err err_set_load "internal$f"; rc=1; }
 		manual_family "$f" >"$TMPD/manual.$f"
 		set_replace manual "$f" "$TMPD/manual.$f" || { err err_set_load "manual$f"; rc=1; }
 	done
@@ -1120,6 +1163,7 @@ cmd_guard() {
 		say guard_restored
 	fi
 	notify_allow_refresh
+	integrations_refresh
 	notify_kick # retries queued messages and sends the "suppressed" summary
 	return 0
 }
@@ -1729,23 +1773,25 @@ notify_hook() { # "event k=v ..." [ready-made body]
 
 # ---- keep the notification endpoints reachable ---------------------------------------------
 allow_union() { # fam -> manual allowlist plus generated entries
-	{ file_family "$ALLOW_FILE" "$1"; file_family "$NOTIFY_ALLOW_FILE" "$1"; } | sort -u
+	{ file_family "$ALLOW_FILE" "$1"; file_family "$NOTIFY_ALLOW_FILE" "$1"; file_family "$INTEG_ALLOW" "$1"; } | sort -u
 }
 
-notify_allow_reload() { # push allow.list + generated entries into the live sets
+allow_reload_live() { # push allow.list + generated entries and the internal networks into the live sets
 	local f
 	[[ -n $FW ]] && fw_live || return 0
 	mk_tmpdir
 	for f in $(fw_families); do
 		allow_union "$f" >"$TMPD/allow.live.$f"
 		set_replace allow "$f" "$TMPD/allow.live.$f" || true
+		file_family "$INTEG_INTERNAL" "$f" >"$TMPD/internal.live.$f"
+		set_replace internal "$f" "$TMPD/internal.live.$f" || true
 	done
 }
 
 notify_allow_refresh() { # best effort, needs DNS
 	local hosts="" h tmp
 	if ! ncfg_load || [[ ${CFG[notify_enabled]} != yes || ${CFG[notify_allow]} != yes ]]; then
-		[[ -e $NOTIFY_ALLOW_FILE ]] && { rm -f -- "$NOTIFY_ALLOW_FILE"; notify_allow_reload; }
+		[[ -e $NOTIFY_ALLOW_FILE ]] && { rm -f -- "$NOTIFY_ALLOW_FILE"; allow_reload_live; }
 		return 0
 	fi
 	[[ -n ${NCFG[telegram_token]} ]] && hosts=api.telegram.org
@@ -1763,7 +1809,7 @@ notify_allow_refresh() { # best effort, needs DNS
 	done
 	[[ -s $tmp ]] || return 0 # keep the previous addresses when DNS fails
 	sort -u "$tmp" | write_atomic "$NOTIFY_ALLOW_FILE"
-	notify_allow_reload
+	allow_reload_live
 }
 
 # ---- daily digest ---------------------------------------------------------------------------
@@ -1947,6 +1993,323 @@ cmd_notify() {
 			cfg_set notify_events "$1"; digest_timer_sync; say ns_events "${CFG[notify_events]:--}" ;;
 		*) die err_usage notify ;;
 	esac
+}
+
+# ---- integrations (tech.md section 8) --------------------------------------------------------
+# bb never touches the rules of Docker, k8s, ufw or firewalld. It only learns their networks:
+#  - container/pod networks -> set "internal": exempt only when BOTH ends are internal, so
+#    pod<->pod passes while a pod talking to a blocked address is still dropped;
+#  - node addresses -> regular allowlist (exempt as either endpoint).
+norm_nets() { # stdin: free-form networks -> canonical, one per line (private ranges kept)
+	awk -v strip=0 -v minp4=$MIN_PREFIX4 -v minp6=$MIN_PREFIX6 -v hosts=0 -f "$AWK_NET" | awk -F'\t' '{ print $2 }'
+}
+
+integ_enabled() { # name -> 0 if this integration is switched on by the configuration
+	local i=${CFG[integrations]}
+	[[ $i == none ]] && return 1
+	[[ $i == auto ]] && { [[ $1 == docker || $1 == k8s ]]; return; }
+	[[ ,$i, == *,"$1",* ]]
+}
+
+docker_present() {
+	have docker && return 0
+	have ip && ip -o link show 2>/dev/null | awk '{ n = $2; sub(/[:@].*/, "", n); if (n == "docker0" || n ~ /^br-/) f = 1 } END { exit !f }'
+}
+
+docker_nets() {
+	local ids
+	if have ip; then
+		ip -o addr show 2>/dev/null | awk '
+			{ n = $2; sub(/@.*/, "", n); if (n != "docker0" && n !~ /^br-/) next
+			  if ($3 == "inet6" && $4 ~ /^fe80:/) next
+			  if ($3 == "inet" || $3 == "inet6") print $4 }'
+	fi
+	if have docker; then
+		ids=$(timeout 5 docker network ls -q 2>/dev/null | tr '\n' ' ')
+		# shellcheck disable=SC2086
+		[[ -n $ids ]] && timeout 5 docker network inspect $ids --format '{{range .IPAM.Config}}{{.Subnet}} {{end}}' 2>/dev/null | tr ' ' '\n'
+	fi
+	return 0
+}
+
+# YAML-ish "key: value" / "key:\n  - value" reader for the k3s configuration files
+yaml_values() { # key files...
+	local key=$1
+	shift
+	[[ $# -gt 0 ]] || return 0
+	awk -v key="$key" '
+		function emit(v,   n, a, i) { gsub(/["\x27]/, "", v); n = split(v, a, ","); for (i = 1; i <= n; i++) { gsub(/^[ \t]+|[ \t]+$/, "", a[i]); if (a[i] != "") print a[i] } }
+		/^[ \t]*#/ { next }
+		$0 ~ "^[ \t]*" key ":" { v = $0; sub(/^[^:]*:[ \t]*/, "", v); sub(/[ \t]*#.*/, "", v); inlist = (v == ""); if (!inlist) emit(v); next }
+		inlist && /^[ \t]*-[ \t]/ { v = $0; sub(/^[ \t]*-[ \t]*/, "", v); sub(/[ \t]*#.*/, "", v); emit(v); next }
+		inlist && NF { inlist = 0 }' "$@" 2>/dev/null
+}
+
+k3s_files() { local f; for f in "$K3S_DIR/config.yaml" "$K3S_DIR"/config.yaml.d/*.yaml; do [[ -r $f ]] && printf '%s\n' "$f"; done; }
+k3s_present() { [[ -d $K3S_DIR ]] || have k3s; }
+kubeadm_present() { [[ -d $KUBE_MANIFEST_DIR ]]; }
+
+k8s_present() {
+	k3s_present || kubeadm_present || [[ -n ${CFG[k8s_pod_cidr]}${CFG[k8s_service_cidr]} ]]
+}
+
+# kind = pod | service
+k8s_nets() {
+	local kind=$1 key flag manual found=0 f v
+	local -a files=()
+	if [[ $kind == pod ]]; then key=cluster-cidr flag=cluster-cidr manual=${CFG[k8s_pod_cidr]}
+	else key=service-cidr flag=service-cluster-ip-range manual=${CFG[k8s_service_cidr]}; fi
+	if k3s_present; then
+		while IFS= read -r f; do files+=("$f"); done < <(k3s_files)
+		v=$(yaml_values "$key" "${files[@]+"${files[@]}"}")
+		if [[ -n $v ]]; then printf '%s\n' "$v"; found=1; fi
+	fi
+	if kubeadm_present; then
+		v=$(grep -hoE -- "--$flag=[^ \"']+" "$KUBE_MANIFEST_DIR"/*.yaml 2>/dev/null | sed 's/^[^=]*=//' | tr ',' '\n')
+		if [[ -n $v ]]; then printf '%s\n' "$v"; found=1; fi
+	fi
+	# k3s defaults apply when nothing was configured
+	if ((found == 0)) && k3s_present && ! kubeadm_present; then
+		if [[ $kind == pod ]]; then printf '10.42.0.0/16\n'; else printf '10.43.0.0/16\n'; fi
+	fi
+	[[ -n $manual ]] && printf '%s\n' "${manual//,/$'\n'}"
+	return 0
+}
+
+k8s_nodes() { # node addresses, only when kubectl answers
+	have kubectl || return 0
+	local kc=""
+	[[ -r $K3S_DIR/k3s.yaml ]] && kc=$K3S_DIR/k3s.yaml
+	KUBECONFIG=${kc:-${KUBECONFIG:-}} timeout 5 kubectl get nodes -o \
+		'jsonpath={range .items[*]}{range .status.addresses[*]}{.type}={.address}{"\n"}{end}{end}' 2>/dev/null |
+		awk -F= '$1 == "InternalIP" || $1 == "ExternalIP" { print $2 }'
+}
+
+ufw_state() { # active | inactive | absent
+	if ! have ufw && [[ ! -e $UFW_CONF ]]; then printf 'absent\n'; return; fi
+	if have ufw && timeout 3 ufw status 2>/dev/null | grep -q '^Status: active'; then printf 'active\n'; return; fi
+	if [[ -r $UFW_CONF ]] && grep -qiE '^ENABLED=yes' "$UFW_CONF"; then printf 'active\n'; return; fi
+	printf 'inactive\n'
+}
+
+firewalld_state() { # active | inactive | absent
+	if ! have firewall-cmd && [[ ! -e $FIREWALLD_CONF ]]; then printf 'absent\n'; return; fi
+	if have firewall-cmd && [[ $(timeout 3 firewall-cmd --state 2>/dev/null) == running ]]; then printf 'active\n'; else printf 'inactive\n'; fi
+}
+
+firewalld_backend() {
+	local b=""
+	[[ -r $FIREWALLD_CONF ]] && b=$(sed -n 's/^FirewallBackend=\(.*\)$/\1/p' "$FIREWALLD_CONF" | head -1)
+	printf '%s\n' "${b:-nftables}"
+}
+
+# Recompute the generated files from what is installed now. Cheap, no daemon is touched.
+integrations_refresh() {
+	local new_int new_allow old_int old_allow changed=0 n_int n_allow
+	mk_tmpdir
+	new_int=$TMPD/integ.internal new_allow=$TMPD/integ.allow
+	: >"$new_int"
+	: >"$new_allow"
+	if integ_enabled docker && docker_present; then docker_nets | norm_nets >>"$new_int"; fi
+	if integ_enabled k8s && k8s_present; then
+		{ k8s_nets pod; k8s_nets service; } | norm_nets >>"$new_int"
+		k8s_nodes | norm_nets >>"$new_allow"
+	fi
+	sort -u -o "$new_int" "$new_int"
+	sort -u -o "$new_allow" "$new_allow"
+	old_int=$(cat "$INTEG_INTERNAL" 2>/dev/null)
+	old_allow=$(cat "$INTEG_ALLOW" 2>/dev/null)
+	[[ $old_int == "$(cat "$new_int")" && $old_allow == "$(cat "$new_allow")" ]] && return 0
+	mkdir -p -- "$STATE_DIR"
+	write_atomic "$INTEG_INTERNAL" <"$new_int"
+	write_atomic "$INTEG_ALLOW" <"$new_allow"
+	allow_reload_live
+	n_int=$(awk 'END { print NR }' "$new_int")
+	n_allow=$(awk 'END { print NR }' "$new_allow")
+	log_event "integration_changed internal=$n_int nodes=$n_allow"
+	return 0
+}
+
+integ_status_lines() { # prints the status table
+	local n st c
+	say integ_mode "${CFG[integrations]}"
+	# docker
+	if docker_present; then st=$(t st_detected); else st=$(t st_absent); fi
+	c=$(docker_nets | norm_nets | sort -u | awk 'END { print NR }')
+	say integ_row docker "$st" "$(t integ_d_docker "$c")"
+	# k8s
+	if k8s_present; then st=$(t st_detected); else st=$(t st_absent); fi
+	c=$({ k8s_nets pod; k8s_nets service; } | norm_nets | sort -u | awk 'END { print NR }')
+	n=$(k8s_nodes | norm_nets | sort -u | awk 'END { print NR }')
+	say integ_row k8s "$st" "$(t integ_d_k8s "$c" "$n")"
+	# ufw / firewalld: status only, their rules are never changed
+	st=$(ufw_state)
+	say integ_row ufw "$(t "st_$st")" "$(t integ_d_ufw "$(t "st_$st")")"
+	st=$(firewalld_state)
+	say integ_row firewalld "$(t "st_$st")" "$(t integ_d_fwd "$(t "st_$st")" "$(firewalld_backend)")"
+}
+
+cmd_integrate() {
+	local sub=${1:-status} cur
+	[[ $# -gt 0 ]] && shift
+	need_root; take_lock; load_config
+	case $sub in
+		status) integ_status_lines; return 0 ;;
+		auto | none) cfg_set integrations "$sub" ;;
+		docker | k8s | ufw | firewalld)
+			cur=${CFG[integrations]}
+			if [[ $cur == auto || $cur == none ]]; then cur=$sub
+			elif [[ ,$cur, != *,"$sub",* ]]; then cur+=",$sub"; fi
+			cfg_set integrations "$cur" ;;
+		*) die err_integrate_name "$sub" ;;
+	esac
+	integrations_refresh
+	say integ_updated "${CFG[integrations]}" "$(awk 'END { print NR }' "$INTEG_INTERNAL" 2>/dev/null || printf 0)" "$(awk 'END { print NR }' "$INTEG_ALLOW" 2>/dev/null || printf 0)"
+}
+
+# ---- bb doctor -----------------------------------------------------------------------------------
+DOC_FAIL=0 DOC_WARN=0
+doc() { # level(ok|warn|fail) key args...
+	local lvl=$1 lbl
+	shift
+	case $lvl in
+		ok) lbl=$(t doc_lbl_ok) ;;
+		warn) lbl=$(t doc_lbl_warn); DOC_WARN=$((DOC_WARN + 1)) ;;
+		fail) lbl=$(t doc_lbl_fail); DOC_FAIL=$((DOC_FAIL + 1)) ;;
+	esac
+	printf '[%s] ' "$lbl"
+	say "$@"
+}
+
+doctor_backend() {
+	local missing
+	if [[ -z ${CFG[backend]} ]]; then doc fail doc_not_configured; return; fi
+	fw_select
+	missing=$(fw_missing_list)
+	if [[ -z $missing ]]; then doc ok doc_backend_ok "${CFG[backend]}"; else doc fail doc_backend_missing "${CFG[backend]}" "$missing"; return; fi
+	if [[ $FW == ipt ]]; then
+		if ipset list -n >/dev/null 2>&1; then doc ok doc_kernel_ok ipset; else doc fail doc_kernel_fail ipset; fi
+		doc ok doc_variant "$(iptables_variant)"
+	else
+		if nft list tables >/dev/null 2>&1; then doc ok doc_kernel_ok nf_tables; else doc fail doc_kernel_fail nf_tables; fi
+	fi
+}
+
+doctor_rules() {
+	[[ -n $FW ]] || return 0
+	if fw_check >/dev/null 2>&1; then doc ok doc_rules_ok; else doc fail doc_rules_fail; fi
+}
+
+doctor_units() {
+	local u
+	if ! have_systemd || ! have systemctl; then doc warn doc_nosystemd; return; fi
+	for u in bb-firewall.service bb-update.timer bb-guard.timer; do
+		if systemctl is-enabled --quiet "$u" 2>/dev/null; then doc ok doc_unit_ok "$u"; else doc fail doc_unit_fail "$u"; fi
+	done
+	[[ ${CFG[backend]} == iptables ]] && { if systemctl is-enabled --quiet bb-sets.service 2>/dev/null; then doc ok doc_unit_ok bb-sets.service; else doc fail doc_unit_fail bb-sets.service; fi; }
+	for u in bb-guard.timer bb-update.timer; do
+		systemctl is-active --quiet "$u" 2>/dev/null || doc warn doc_timer_warn "$u"
+	done
+}
+
+doctor_allow() {
+	local n
+	n=$(awk 'END { print NR }' "$ALLOW_FILE" 2>/dev/null || printf 0)
+	if ((n > 0)); then doc ok doc_allow_ok "$n"; else doc warn doc_allow_warn; fi
+}
+
+doctor_conflicts() {
+	local found="" f
+	if have systemctl && systemctl is-enabled --quiet nftables.service 2>/dev/null; then
+		if [[ -r $NFTABLES_CONF ]] && grep -qE '^[[:space:]]*flush[[:space:]]+ruleset' "$NFTABLES_CONF"; then
+			doc warn doc_nft_flush "$NFTABLES_CONF"
+		else
+			doc ok doc_nft_ok
+		fi
+	fi
+	# other tools use their own objects; list what is there
+	if have iptables && iptables -S 2>/dev/null | grep -q 'f2b-'; then found+=" fail2ban"; fi
+	if have nft; then
+		f=$(nft list tables 2>/dev/null)
+		[[ $f == *fail2ban* ]] && found+=" fail2ban"
+		[[ $f == *crowdsec* ]] && found+=" crowdsec"
+		[[ $f == *ts-* || $f == *tailscale* ]] && found+=" tailscale"
+	fi
+	have ip && ip -o link show 2>/dev/null | grep -q 'tailscale0' && found+=" tailscale"
+	have ip && have iptables && iptables -S 2>/dev/null | grep -q 'ts-input' && found+=" tailscale"
+	found=$(printf '%s\n' $found | awk 'NF && !s[$0]++' | tr '\n' ' ')
+	[[ -z $found ]] || doc ok doc_others "${found% }"
+}
+
+doctor_integrations() {
+	local st n
+	if docker_present; then
+		n=$(docker_nets | norm_nets | sort -u | awk 'END { print NR }')
+		doc ok doc_int_docker "$n"
+	fi
+	if k8s_present; then
+		n=$({ k8s_nets pod; k8s_nets service; } | norm_nets | sort -u | awk 'END { print NR }')
+		if ((n > 0)); then doc ok doc_int_k8s "$n"; else doc warn doc_k8s_nocidr; fi
+	fi
+	st=$(ufw_state)
+	if [[ $st == active ]]; then
+		doc ok doc_int_ufw "$(t st_active)"
+		[[ -s $ALLOW_FILE ]] || doc warn doc_ufw_admin
+	fi
+	st=$(firewalld_state)
+	[[ $st == active ]] && doc ok doc_int_fwd "$(firewalld_backend)"
+	return 0
+}
+
+doctor_selinux() {
+	have getenforce || return 0
+	local mode n
+	mode=$(getenforce 2>/dev/null)
+	doc ok doc_selinux "$mode"
+	[[ $mode == Enforcing ]] || return 0
+	if have ausearch; then
+		n=$(ausearch -m avc -ts recent -c bb 2>/dev/null | grep -c '^type=AVC') || true
+		((${n:-0} > 0)) && doc warn doc_avc "$n"
+	fi
+	return 0
+}
+
+doctor_files() {
+	local f m own l q
+	m=$(stat -c %a "$CONF_FILE" 2>/dev/null)
+	[[ -z $m || $m == 600 ]] || doc warn doc_conf_perm "$m"
+	if [[ -e $NOTIFY_CONF ]]; then
+		m=$(stat -c %a "$NOTIFY_CONF")
+		own=$(stat -c %u "$NOTIFY_CONF")
+		if [[ $m == 600 && $own == 0 ]]; then doc ok doc_perm_ok; else doc fail doc_perm_fail "$m"; fi
+		q=$(queue_len)
+		((q > 0)) && doc warn doc_queue "$q"
+	fi
+	for l in en ru; do
+		[[ -r $SHARE_DIR/lang/$l.sh ]] || doc fail doc_catalog_fail "$l.sh"
+	done
+	[[ -r $SHARE_DIR/lang/${CFG[lang]}.sh ]] && doc ok doc_catalog_ok "${CFG[lang]}"
+	for f in $SAVED_RULE_FILES; do
+		[[ -r $f ]] && grep -qE 'BB_FILTER|(^| )bb_[a-z]' "$f" && doc warn doc_saved_warn "$f"
+	done
+	return 0
+}
+
+cmd_doctor() {
+	need_root; cfg_load || true
+	[[ -n ${CFG[backend]} ]] && fw_select
+	DOC_FAIL=0 DOC_WARN=0
+	say doc_title
+	doctor_backend
+	doctor_rules
+	doctor_units
+	doctor_allow
+	doctor_conflicts
+	doctor_integrations
+	doctor_selinux
+	doctor_files
+	say doc_summary "$DOC_FAIL" "$DOC_WARN"
+	((DOC_FAIL == 0))
 }
 
 # ---- install / uninstall -------------------------------------------------------
@@ -2362,6 +2725,8 @@ cmd_install() {
 	added=$(allow_autofill | tr '\n' ' ')
 	[[ -z $added ]] || say inst_allow_added "${added% }"
 	fw_select
+	integrations_refresh
+	if [[ -s $INTEG_INTERNAL || -s $INTEG_ALLOW ]]; then say inst_integrations "$(awk 'END { print NR }' "$INTEG_INTERNAL")" "$(awk 'END { print NR }' "$INTEG_ALLOW")"; fi
 	dht_update || true # best effort: DNS may not work yet
 	if ! do_apply; then
 		err err_install_failed
@@ -2512,6 +2877,8 @@ main() {
 		__sets-restore) cmd___sets_restore "$@" ;;
 		__unit) cmd___unit "$@" ;;
 		notify) cmd_notify "$@" ;;
+		integrate) cmd_integrate "$@" ;;
+		doctor) cmd_doctor "$@" ;;
 		__notify-flush) cmd___notify_flush "$@" ;;
 		__notify-event) cmd___notify_event "$@" ;;
 		__digest) cmd___digest "$@" ;;

@@ -17,7 +17,14 @@ A lightweight, CLI-only tool that blocks BitTorrent, DHT and blocklisted IP rang
 > built with `jq`, dedup and hourly limit, a bounded retry queue flushed by the guard timer,
 > best-effort background delivery that can never block a firewall command, `OnFailure=`
 > reporting, the notification endpoints kept in the allowlist, and a daily digest.
-> Not yet: integrations, `bb doctor`, nDPId/listener, `--json`.
+> **Step 6 integrations and diagnostics** (`bb integrate auto|docker|k8s|ufw|firewalld|none|status`,
+> `bb doctor`): Docker networks (interfaces and `docker network inspect`), k3s (config, `config.yaml.d`,
+> defaults), kubeadm (controller-manager manifest), node addresses via `kubectl`, manual
+> `k8s_pod_cidr`/`k8s_service_cidr`; ufw and firewalld are only reported. Networks are refreshed by
+> `bb-guard` and loaded from the cache at boot (no Docker or kubectl needed). `bb doctor` checks the
+> backend, kernel support, rules and jump position, units, allowlist, `nftables.service`
+> `flush ruleset`, other firewall tools, SELinux/AVC, file permissions, queue and language catalogs.
+> Not yet: nDPId/listener (step 7), `--json`, `bb log`, distribution matrix (step 8).
 > Install the files with `make install`, then run `sudo bb install`.
 
 ## Features
@@ -121,3 +128,16 @@ List sources may contain IPs, CIDRs, host names and tracker URLs
 (`udp://host:port/announce`); the host part is extracted and resolved.
 Entries broader than /8 (IPv4) or /16 (IPv6) are rejected so that a bad list cannot
 block everything.
+
+## Deviations from tech.md
+
+- **Integration networks use a separate `internal` set.** The spec says container and pod networks
+  are added to `allow`, and that `allow` passes a packet when its source *or* destination matches.
+  Taken literally, that would also exempt a container talking to a *blocked* address, which
+  contradicts the acceptance criterion "traffic from containers and pods to blocked addresses is
+  dropped, while traffic between the containers and pods themselves passes". bb therefore puts
+  these networks into `internal4/6`, which exempts a packet only when **both** ends are internal.
+  Node addresses still go into the regular allowlist (either end). The tests assert the behaviour
+  with real traffic, and a mutation of the rule is caught.
+- `bb doctor`'s DHT-empty case during `bb install` is a warning, not a failure, so an install on a
+  host without working DNS still completes.

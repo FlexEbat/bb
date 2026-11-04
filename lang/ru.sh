@@ -95,6 +95,7 @@ MSG[help_main]="bb - лёгкий блокировщик BitTorrent, DHT и чё
   allow IP|СЕТЬ [--rm]        никогда не блокировать этот адрес
   list [add|update|rm]        внешние чёрные списки и DHT-узлы
   notify setup|test|status    уведомления в Telegram / Matrix
+  integrate [auto|docker|...] Docker, k3s/k8s, ufw, firewalld   doctor   диагностика
   lang [en|ru]                показать или сменить язык интерфейса
 
 Глобальный параметр: --lang en|ru"
@@ -239,3 +240,66 @@ setup запрашивает секреты (они не показываютс�
 events показывает или задаёт включённые события (через запятую): mode_changed, guard_restored,
 list_update_failed, list_rejected, service_failed, rate_limit, integration_changed,
 manual_change, digest, install, uninstall."
+
+MSG[err_integrate_name]="неизвестная интеграция «%s» (docker, k8s, ufw, firewalld, auto, none или status)"
+MSG[integ_updated]="Интеграции: %s. Внутренних сетей: %s, адресов узлов: %s."
+MSG[inst_integrations]="Интеграции: добавлено внутренних сетей %s и адресов узлов %s."
+MSG[integ_mode]="Интеграции: %s"
+MSG[integ_row]="  %-10s %-12s %s"
+MSG[integ_d_docker]="сетей контейнеров во внутреннем наборе: %s"
+MSG[integ_d_k8s]="сетей подов и сервисов: %s, адресов узлов: %s"
+MSG[integ_d_ufw]="ufw: %s; его правила никогда не меняются"
+MSG[integ_d_fwd]="firewalld: %s (бэкенд %s); его правила никогда не меняются"
+MSG[st_detected]="обнаружен"
+MSG[st_absent]="не найден"
+MSG[st_active]="активен"
+MSG[st_inactive]="не активен"
+
+MSG[doc_title]="bb doctor"
+MSG[doc_lbl_ok]="  ok"
+MSG[doc_lbl_warn]="вним"
+MSG[doc_lbl_fail]="СБОЙ"
+MSG[doc_summary]="Проблем: %s, предупреждений: %s"
+MSG[doc_not_configured]="bb не настроен (бэкенд не выбран)"
+MSG[doc_backend_ok]="бэкенд %s: все необходимые утилиты на месте"
+MSG[doc_backend_missing]="бэкенд %s: не хватает утилит: %s"
+MSG[doc_kernel_ok]="поддержка %s в ядре доступна"
+MSG[doc_kernel_fail]="поддержки %s в ядре нет (модуль не загружен?)"
+MSG[doc_variant]="вариант iptables: %s"
+MSG[doc_rules_ok]="цепочка/таблица bb на месте, переход стоит первым"
+MSG[doc_rules_fail]="правила bb отсутствуют или сместились; «bb guard» восстановит их"
+MSG[doc_unit_ok]="юнит %s включён"
+MSG[doc_unit_fail]="юнит %s не включён"
+MSG[doc_timer_warn]="таймер %s не запущен"
+MSG[doc_nosystemd]="systemd недоступен; юниты проверить нельзя"
+MSG[doc_allow_ok]="в списке исключений записей: %s"
+MSG[doc_allow_warn]="список исключений пуст: добавьте шлюз, DNS и свои административные адреса командой «bb allow»"
+MSG[doc_nft_flush]="nftables.service включён, а %s начинается с «flush ruleset»: его перезапуск сотрёт все таблицы межсетевого экрана (bb-guard восстановит правила bb)"
+MSG[doc_nft_ok]="nftables.service не сбрасывает набор правил"
+MSG[doc_others]="обнаружены другие средства межсетевого экрана: %s (они используют свои объекты)"
+MSG[doc_int_docker]="Docker: известных сетей контейнеров: %s"
+MSG[doc_int_k8s]="k3s/k8s: известных сетей подов и сервисов: %s"
+MSG[doc_k8s_nocidr]="k3s/k8s обнаружен, но сети подов и сервисов неизвестны: задайте k8s_pod_cidr и k8s_service_cidr в bb.conf"
+MSG[doc_int_ufw]="ufw: %s; его правила не затрагиваются"
+MSG[doc_ufw_admin]="ufw активен: «ufw allow» не освобождает от блокировки bb, поэтому держите административные адреса в «bb allow»"
+MSG[doc_int_fwd]="firewalld работает (бэкенд %s); его правила не затрагиваются"
+MSG[doc_selinux]="SELinux: %s"
+MSG[doc_avc]="SELinux недавно запретил действия bb: %s раз (смотрите: ausearch -m avc -c bb)"
+MSG[doc_conf_perm]="у bb.conf должен быть режим 0600 (сейчас %s)"
+MSG[doc_perm_ok]="notify.conf принадлежит root, режим 0600"
+MSG[doc_perm_fail]="notify.conf должен принадлежать root с режимом 0600 (сейчас %s)"
+MSG[doc_queue]="в очереди уведомлений недоставленных сообщений: %s"
+MSG[doc_catalog_ok]="каталоги языков на месте (выбран: %s)"
+MSG[doc_catalog_fail]="отсутствует каталог языка %s"
+MSG[doc_saved_warn]="файл сохранённых правил %s упоминает объекты bb; без bb-sets.service загрузка может не удаться"
+
+MSG[help_integrate]="Использование: bb integrate [status|auto|none|docker|k8s|ufw|firewalld]
+
+bb никогда не меняет правила Docker, k8s, ufw и firewalld. Он узнаёт сети контейнеров и подов
+(между собой они проходят свободно), добавляет адреса узлов в список исключений и показывает
+состояние ufw/firewalld. auto находит Docker и k3s/k8s; если назвать одну интеграцию, включится только она."
+MSG[help_doctor]="Использование: bb doctor
+
+Проверяет бэкенд, поддержку в ядре, правила и их положение, юниты, список исключений, известные
+конфликты (nftables.service, Docker, k8s, ufw, firewalld, fail2ban и др.), SELinux, права файлов,
+очередь уведомлений и каталоги языков. При любом СБОЕ код возврата 1."

@@ -96,6 +96,7 @@ Usage: bb COMMAND [options]       (add --help to any command)
   allow IP|NET [--rm]         never block this address
   list [add|update|rm]        external blocklists and DHT nodes
   notify setup|test|status    Telegram / Matrix notifications
+  integrate [auto|docker|...] Docker, k3s/k8s, ufw, firewalld   doctor   diagnostics
   lang [en|ru]                show or change the interface language
 
 Global option: --lang en|ru"
@@ -240,3 +241,66 @@ message. Telegram needs no extra packages; Matrix needs jq and an unencrypted ro
 events shows or sets the enabled events (comma-separated): mode_changed, guard_restored,
 list_update_failed, list_rejected, service_failed, rate_limit, integration_changed,
 manual_change, digest, install, uninstall."
+
+MSG[err_integrate_name]="unknown integration '%s' (use docker, k8s, ufw, firewalld, auto, none or status)"
+MSG[integ_updated]="Integrations: %s. Internal networks: %s, node addresses: %s."
+MSG[inst_integrations]="Integrations: %s internal networks and %s node addresses added."
+MSG[integ_mode]="Integrations: %s"
+MSG[integ_row]="  %-10s %-12s %s"
+MSG[integ_d_docker]="%s container networks in the internal set"
+MSG[integ_d_k8s]="%s pod/service networks, %s node addresses"
+MSG[integ_d_ufw]="ufw is %s; its rules are never changed"
+MSG[integ_d_fwd]="firewalld is %s (backend %s); its rules are never changed"
+MSG[st_detected]="detected"
+MSG[st_absent]="not found"
+MSG[st_active]="active"
+MSG[st_inactive]="inactive"
+
+MSG[doc_title]="bb doctor"
+MSG[doc_lbl_ok]="  ok"
+MSG[doc_lbl_warn]="warn"
+MSG[doc_lbl_fail]="FAIL"
+MSG[doc_summary]="Problems: %s, warnings: %s"
+MSG[doc_not_configured]="bb is not configured (no backend selected)"
+MSG[doc_backend_ok]="backend %s: all required tools are present"
+MSG[doc_backend_missing]="backend %s: missing tools: %s"
+MSG[doc_kernel_ok]="kernel support for %s is available"
+MSG[doc_kernel_fail]="kernel support for %s is missing (module not loaded?)"
+MSG[doc_variant]="iptables variant: %s"
+MSG[doc_rules_ok]="the bb chain/table is present and the jump is in first position"
+MSG[doc_rules_fail]="the bb rules are missing or displaced; 'bb guard' restores them"
+MSG[doc_unit_ok]="unit %s is enabled"
+MSG[doc_unit_fail]="unit %s is not enabled"
+MSG[doc_timer_warn]="timer %s is not running"
+MSG[doc_nosystemd]="systemd is not available; units cannot be checked"
+MSG[doc_allow_ok]="the allowlist has %s entries"
+MSG[doc_allow_warn]="the allowlist is empty: add the gateway, DNS and your admin addresses with 'bb allow'"
+MSG[doc_nft_flush]="nftables.service is enabled and %s starts with 'flush ruleset': restarting it wipes every firewall table (bb-guard restores the bb rules)"
+MSG[doc_nft_ok]="nftables.service does not flush the ruleset"
+MSG[doc_others]="other firewall tools detected: %s (they use their own objects)"
+MSG[doc_int_docker]="Docker: %s container networks are known"
+MSG[doc_int_k8s]="k3s/k8s: %s pod/service networks are known"
+MSG[doc_k8s_nocidr]="k3s/k8s detected but the pod/service networks are unknown: set k8s_pod_cidr and k8s_service_cidr in bb.conf"
+MSG[doc_int_ufw]="ufw is %s; its rules are not touched"
+MSG[doc_ufw_admin]="ufw is active: 'ufw allow' does not exempt anyone from bb, so keep your admin addresses in 'bb allow'"
+MSG[doc_int_fwd]="firewalld is running (backend %s); its rules are not touched"
+MSG[doc_selinux]="SELinux: %s"
+MSG[doc_avc]="SELinux denied bb %s times recently (see: ausearch -m avc -c bb)"
+MSG[doc_conf_perm]="bb.conf should have mode 0600 (found %s)"
+MSG[doc_perm_ok]="notify.conf is owned by root with mode 0600"
+MSG[doc_perm_fail]="notify.conf must be owned by root with mode 0600 (found %s)"
+MSG[doc_queue]="the notification queue holds %s undelivered messages"
+MSG[doc_catalog_ok]="language catalogs are in place (selected: %s)"
+MSG[doc_catalog_fail]="language catalog %s is missing"
+MSG[doc_saved_warn]="saved rules file %s mentions bb objects; boot could fail without bb-sets.service"
+
+MSG[help_integrate]="Usage: bb integrate [status|auto|none|docker|k8s|ufw|firewalld]
+
+bb never changes the rules of Docker, k8s, ufw or firewalld. It learns container and pod
+networks (they pass only between each other), adds node addresses to the allowlist, and
+reports ufw/firewalld. auto detects Docker and k3s/k8s; naming one enables just that one."
+MSG[help_doctor]="Usage: bb doctor
+
+Checks the backend, kernel support, rules and their position, units, the allowlist, known
+conflicts (nftables.service, Docker, k8s, ufw, firewalld, fail2ban, ...), SELinux, file
+permissions, the notification queue and the language catalogs. Exit code 1 on any FAIL."
