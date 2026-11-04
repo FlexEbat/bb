@@ -94,6 +94,7 @@ MSG[help_main]="bb - лёгкий блокировщик BitTorrent, DHT и чё
   ban IP|СЕТЬ [--ttl 7d]      ручная блокировка   unban IP|СЕТЬ   снять блокировку
   allow IP|СЕТЬ [--rm]        никогда не блокировать этот адрес
   list [add|update|rm]        внешние чёрные списки и DHT-узлы
+  notify setup|test|status    уведомления в Telegram / Matrix
   lang [en|ru]                показать или сменить язык интерфейса
 
 Глобальный параметр: --lang en|ru"
@@ -177,3 +178,64 @@ MSG[help_uninstall]="Использование: bb uninstall [--yes] [--purge]
 
 Удаляет правила, наборы и юниты bb. Остальные правила межсетевого экрана не затрагиваются,
 из файлов сохранённых правил убираются записи bb. С --purge удаляются также конфигурация и состояние."
+
+MSG[err_notify_bad_value]="некорректное значение: %s"
+MSG[err_notify_chat_detect]="не удалось определить ID чата (установлен ли jq и писали ли вы боту?)"
+MSG[err_notify_event]="неизвестное событие «%s»"
+MSG[err_notify_jq]="для %s нужен jq (установите его менеджером пакетов)"
+MSG[err_notify_none]="канал уведомлений не настроен; выполните «bb notify setup telegram|matrix»"
+MSG[err_notify_test_failed]="доставка в %s не удалась (код curl %s); ничего не сохранено"
+MSG[warn_notify_test_failed]="доставка в %s не удалась (код curl %s)"
+
+MSG[notify_setup_token]="Токен бота:"
+MSG[notify_setup_chat]="ID чата (оставьте пустым, чтобы определить его после сообщения боту):"
+MSG[notify_setup_chat_wait]="Напишите боту любое сообщение, затем нажмите Enter."
+MSG[notify_setup_url]="Адрес homeserver (https://...):"
+MSG[notify_setup_mtoken]="Токен доступа:"
+MSG[notify_setup_room]="ID комнаты (!id:server):"
+MSG[notify_testing]="Отправка тестового сообщения..."
+MSG[notify_test_ok]="Доставлено: %s."
+MSG[notify_saved]="Канал %s сохранён; уведомления включены."
+MSG[notify_enabled]="Уведомления включены."
+MSG[notify_disabled]="Уведомления выключены."
+
+MSG[word_on]="включены"
+MSG[word_off]="выключены"
+MSG[word_configured]="настроен"
+MSG[word_not_configured]="не настроен"
+MSG[ns_state]="Уведомления: %s"
+MSG[ns_channel]="Канал %s: %s"
+MSG[ns_events]="События: %s"
+MSG[ns_queue]="Очередь: %s, подавлено: %s"
+
+MSG[ev_mode_changed]="теперь режим %s"
+MSG[ev_mode_reverted]="выполнен возврат в режим %s (block не подтверждён вовремя)"
+MSG[ev_guard_restored]="правила пропали или сместились и были восстановлены"
+MSG[ev_list_update_failed]="не удалось скачать список %s"
+MSG[ev_list_rejected]="список %s отклонён: %s"
+MSG[ev_service_failed]="сбой юнита %s"
+MSG[ev_rate_limit]="достигнут предел добавления потоков"
+MSG[ev_integration_changed]="изменён список исключений интеграций"
+MSG[ev_manual_change]="ручное изменение: %s"
+MSG[ev_install]="bb установлен, бэкенд %s"
+MSG[ev_uninstall]="bb удалён"
+MSG[ev_test]="уведомления работают"
+MSG[rsn_empty]="нет корректных записей"
+MSG[rsn_shrunk]="резко сократился"
+MSG[rsn_size]="слишком большой"
+MSG[rsn_sha256]="не совпала контрольная сумма"
+MSG[msg_footer]="режим: %s, бэкенд: %s"
+MSG[msg_suppressed]="подавлено уведомлений: %s"
+MSG[dg_mode]="Режим: %s, бэкенд: %s"
+MSG[dg_sets]="Наборы: %s"
+MSG[dg_packets]="Пакетов с прошлой сводки: %s"
+MSG[dg_lists]="Списки (записей): %s"
+MSG[dg_events]="События за 24 ч: %s"
+
+MSG[help_notify]="Использование: bb notify setup telegram|matrix | test | status | enable | disable | events [СПИСОК]
+
+setup запрашивает секреты (они не показываются и не попадают в журнал) и проверяет их тестовым
+сообщением. Для Telegram дополнительные пакеты не нужны; для Matrix нужны jq и незашифрованная комната.
+events показывает или задаёт включённые события (через запятую): mode_changed, guard_restored,
+list_update_failed, list_rejected, service_failed, rate_limit, integration_changed,
+manual_change, digest, install, uninstall."

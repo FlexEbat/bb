@@ -43,6 +43,15 @@ else
 	RESOLV_FILES="/etc/resolv.conf /run/systemd/resolve/resolv.conf"
 fi
 PENDING_FILE=$STATE_DIR/mode.pending
+NOTIFY_CONF=$CONF_DIR/notify.conf
+NOTIFY_QUEUE=$STATE_DIR/notify.queue
+NOTIFY_DEDUP=$STATE_DIR/notify.dedup
+NOTIFY_RATE=$STATE_DIR/notify.rate
+NOTIFY_SUPP=$STATE_DIR/notify.suppressed
+NOTIFY_LOCK=$STATE_DIR/notify.lock
+NOTIFY_FLUSH_LOCK=$STATE_DIR/notify.flush.lock
+NOTIFY_ALLOW_FILE=$STATE_DIR/notify.allow
+DIGEST_SNAP=$STATE_DIR/digest.counters
 CONF_FILE=$CONF_DIR/bb.conf
 ALLOW_FILE=$CONF_DIR/allow.list
 MANUAL_FILE=$CONF_DIR/manual.list
@@ -98,8 +107,9 @@ locale_is_utf8() {
 }
 
 log_event() { # stable English event tags for journald: log_event tag [k=v ...]
-	command -v logger >/dev/null 2>&1 || return 0
-	logger -t bb -- "$*" 2>/dev/null || true
+	if command -v logger >/dev/null 2>&1; then logger -t bb -- "$*" 2>/dev/null; fi
+	notify_hook "$*" >/dev/null 2>&1 # best effort: never blocks or fails a firewall operation
+	return 0
 }
 
 have() {
@@ -186,6 +196,10 @@ cfg_defaults() {
 		[integrations]=auto [guard_interval]=300 [confirm_timeout]=60
 		[flow_rate_limit]=1000 [iface]='' [ports_mode]=all [ports]=''
 		[list_max_size]=268435456 [resolve_max]=5000 [dpi]=no
+		[notify_enabled]=no
+		[notify_events]='mode_changed,guard_restored,list_update_failed,list_rejected,service_failed,rate_limit'
+		[notify_dedup]=30m [notify_rate_limit]=20 [notify_queue_ttl]=24h [notify_queue_max]=200
+		[notify_allow]=yes [notify_proxy]='' [notify_lang]=''
 	)
 }
 
@@ -196,7 +210,12 @@ cfg_valid() { # key value
 		backend) [[ -z $v || $v == iptables || $v == nft ]] ;;
 		install_backend) [[ $v == iptables || $v == nft ]] ;;
 		mode) [[ $v == monitor || $v == block ]] ;;
-		ipv6 | strip_private | dpi) [[ $v == yes || $v == no ]] ;;
+		ipv6 | strip_private | dpi | notify_enabled | notify_allow) [[ $v == yes || $v == no ]] ;;
+		notify_events) notify_events_valid "$v" ;;
+		notify_dedup | notify_queue_ttl) dur2sec "$v" >/dev/null ;;
+		notify_rate_limit | notify_queue_max) is_uint "$v" && ((v >= 1)) ;;
+		notify_proxy) [[ -z $v || $v =~ ^(https?|socks5h?)://[^[:space:]\"\\]+$ ]] ;;
+		notify_lang) [[ -z $v || $v == en || $v == ru ]] ;;
 		hook_priority) [[ $v =~ ^-?[0-9]{1,5}$ ]] ;;
 		list_maxelem | flow_maxelem | flow_dedup | max_event_size | confirm_timeout | flow_rate_limit | list_max_size | resolve_max)
 			is_uint "$v" && ((v >= 1)) ;;
@@ -846,7 +865,7 @@ sets_load_all() {
 	mk_tmpdir
 	manual_prune
 	for f in $(fw_families); do
-		file_family "$ALLOW_FILE" "$f" >"$TMPD/allow.$f"
+		allow_union "$f" >"$TMPD/allow.$f"
 		set_replace allow "$f" "$TMPD/allow.$f" || { err err_set_load "allow$f"; rc=1; }
 		manual_family "$f" >"$TMPD/manual.$f"
 		set_replace manual "$f" "$TMPD/manual.$f" || { err err_set_load "manual$f"; rc=1; }
@@ -1095,10 +1114,14 @@ cmd_guard() {
 	need_root; take_lock; load_config require
 	fw_tools_ok || exit 1
 	mode_check_pending
-	fw_check && exit 0
-	log_event "guard_restored backend=${CFG[backend]}"
-	do_apply || exit 1
-	say guard_restored
+	if ! fw_check; then
+		log_event "guard_restored backend=${CFG[backend]}"
+		do_apply || exit 1
+		say guard_restored
+	fi
+	notify_allow_refresh
+	notify_kick # retries queued messages and sends the "suppressed" summary
+	return 0
 }
 
 # Hidden helper (used by the installer and the tests): write a default bb.conf.
@@ -1378,6 +1401,7 @@ cmd_list() {
 				dht_update; rc=$?
 				if ((rc == 0)); then [[ -n $FW ]] && fw_live && { sets_refresh dht || worst=1; }; else worst=1; fi
 			fi
+			notify_allow_refresh
 			exit "$worst" ;;
 		rm)
 			[[ $# -eq 1 ]] || die err_usage list
@@ -1413,10 +1437,522 @@ cmd___remove() {
 	fw_remove
 }
 
+# ---- notifications (tech.md section 9) ---------------------------------------------------
+NOTIFY_EVENTS_ALL="mode_changed guard_restored list_update_failed list_rejected service_failed rate_limit integration_changed manual_change digest install uninstall"
+declare -A NCFG=()
+
+notify_events_valid() { # comma list of known event ids (may be empty)
+	local e
+	[[ -z $1 ]] && return 0
+	local IFS=,
+	for e in $1; do
+		[[ " $NOTIFY_EVENTS_ALL " == *" $e "* ]] || return 1
+	done
+}
+
+ncfg_valid() { # key value
+	local k=$1 v=$2
+	case $k in
+		telegram_token) [[ $v =~ ^[0-9]{5,12}:[A-Za-z0-9_-]{20,64}$ ]] ;;
+		telegram_chat) [[ $v =~ ^(-?[0-9]{1,20}|@[A-Za-z0-9_]{4,64})$ ]] ;;
+		matrix_url) [[ $v =~ ^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._~/-]*)?$ ]] ;;
+		matrix_token) [[ $v =~ ^[A-Za-z0-9._~+/=-]{8,512}$ ]] ;;
+		matrix_room) [[ $v =~ ^![A-Za-z0-9._=/+-]{1,128}:[A-Za-z0-9.-]{1,253}(:[0-9]{1,5})?$ ]] ;;
+		*) return 1 ;;
+	esac
+}
+
+ncfg_load() {
+	NCFG=([telegram_token]='' [telegram_chat]='' [matrix_url]='' [matrix_token]='' [matrix_room]='')
+	[[ -r $NOTIFY_CONF ]] || return 1
+	local line k v
+	while IFS= read -r line || [[ -n $line ]]; do
+		if [[ $line =~ ^notify_([a-z_]+)=\'([^\']*)\'$ ]]; then
+			k=${BASH_REMATCH[1]} v=${BASH_REMATCH[2]}
+			[[ -v NCFG[$k] ]] && ncfg_valid "$k" "$v" && NCFG[$k]=$v
+		fi
+	done <"$NOTIFY_CONF"
+	return 0
+}
+
+ncfg_save() { # secrets only; root, 0600, atomic
+	local k
+	mkdir -p -- "$CONF_DIR" || return 1
+	{
+		printf '# bb notification secrets - root only, never copy into tickets or chats\n' # bb-lint: ok
+		for k in telegram_token telegram_chat matrix_url matrix_token matrix_room; do
+			printf "notify_%s='%s'\n" "$k" "${NCFG[$k]}"
+		done
+	} | write_atomic "$NOTIFY_CONF"
+}
+
+notify_channels() { # prints configured channels, one per line
+	[[ -n ${NCFG[telegram_token]} && -n ${NCFG[telegram_chat]} ]] && printf 'telegram\n'
+	[[ -n ${NCFG[matrix_url]} && -n ${NCFG[matrix_token]} && -n ${NCFG[matrix_room]} ]] && have jq && printf 'matrix\n'
+	return 0
+}
+
+notify_host() { { hostname 2>/dev/null || uname -n; } | tr -cd 'A-Za-z0-9._-' | head -c 64; }
+
+# Quote a string for a curl config file ("-K"): the secrets and the message travel on
+# stdin, never on the command line.
+curl_q() {
+	local s=$1
+	s=${s//\\/\\\\}
+	s=${s//\"/\\\"}
+	s=${s//$'\n'/\\n}
+	s=${s//$'\t'/\\t}
+	s=${s//$'\r'/\\r}
+	printf '%s' "$s"
+}
+
+notify_curl_common() {
+	printf 'silent\nfail\nmax-time = 10\nconnect-timeout = 10\nproto = "=https"\noutput = "/dev/null"\n'
+	[[ -n ${CFG[notify_proxy]} ]] && printf 'proxy = "%s"\n' "$(curl_q "${CFG[notify_proxy]}")"
+	return 0
+}
+
+# Each sender returns curl's exit code. Nothing secret is ever echoed or logged.
+send_telegram() { # text
+	local text=${1:0:3900}
+	{
+		printf 'url = "https://api.telegram.org/bot%s/sendMessage"\n' "${NCFG[telegram_token]}"
+		printf 'data-urlencode = "chat_id=%s"\n' "$(curl_q "${NCFG[telegram_chat]}")"
+		printf 'data-urlencode = "text=%s"\n' "$(curl_q "$text")"
+		notify_curl_common
+	} | curl -K - >/dev/null 2>&1
+}
+
+send_matrix() { # [txn_id] text  (a retried queue entry reuses its transaction id)
+	local txn text json room
+	if (($# >= 2)); then txn=$1 text=$2; else text=$1 txn="bb$(date +%s%N)$RANDOM"; fi
+	have jq || return 127
+	json=$(jq -nc --arg body "${text:0:3900}" '{msgtype: "m.text", body: $body}') || return 1
+	room=$(jq -rn --arg v "${NCFG[matrix_room]}" '$v | @uri') || return 1
+	{
+		printf 'url = "%s/_matrix/client/v3/rooms/%s/send/m.room.message/%s"\n' "${NCFG[matrix_url]%/}" "$room" "$txn"
+		printf 'request = "PUT"\n'
+		printf 'header = "Authorization: Bearer %s"\n' "${NCFG[matrix_token]}"
+		printf 'header = "Content-Type: application/json"\n'
+		printf 'data = "%s"\n' "$(curl_q "$json")"
+		notify_curl_common
+	} | curl -K - >/dev/null 2>&1
+}
+
+# ---- message composition (in the notification language) ---------------------------------
+kv_get() { # "k=v k=v" key -> sanitized value (untrusted input never reaches a message raw)
+	local w
+	for w in $1; do
+		if [[ $w == "$2="* ]]; then
+			w=${w#*=}
+			w=${w//[^A-Za-z0-9._@:-]/?}
+			printf '%s' "${w:0:64}"
+			return 0
+		fi
+	done
+}
+
+notify_lang() { local l=${CFG[notify_lang]:-}; [[ -n $l ]] || l=${CFG[lang]}; printf '%s\n' "$l"; }
+
+# notify_compose event "k=v ..." -> one-line text; digest/test bodies come ready-made.
+notify_compose() {
+	local ev=$1 rest=$2 body=${3:-} nl host
+	nl=$(notify_lang)
+	host=$(notify_host)
+	(
+		i18n_load "$nl"
+		local name reason text
+		case $ev in
+			mode_changed)
+				reason=$(kv_get "$rest" reason)
+				if [[ -n $reason ]]; then text=$(t ev_mode_reverted "$(kv_get "$rest" mode)")
+				else text=$(t ev_mode_changed "$(kv_get "$rest" mode)"); fi ;;
+			guard_restored) text=$(t ev_guard_restored) ;;
+			list_update_failed) text=$(t ev_list_update_failed "$(kv_get "$rest" name)") ;;
+			list_rejected)
+				reason=$(kv_get "$rest" reason)
+				case $reason in empty | shrunk | size | sha256) reason=$(t "rsn_$reason") ;; *) reason='?' ;; esac
+				text=$(t ev_list_rejected "$(kv_get "$rest" name)" "$reason") ;;
+			service_failed) text=$(t ev_service_failed "$(kv_get "$rest" unit)") ;;
+			rate_limit) text=$(t ev_rate_limit) ;;
+			integration_changed) text=$(t ev_integration_changed) ;;
+			manual_change)
+				name=$(kv_get "$rest" op)
+				case $name in ban | unban | allow | unallow) ;; *) name='?' ;; esac # never the address itself
+				text=$(t ev_manual_change "$name") ;;
+			install) text=$(t ev_install "$(kv_get "$rest" backend)") ;;
+			uninstall) text=$(t ev_uninstall) ;;
+			test) text=$(t ev_test) ;;
+			digest) text=$body ;;
+			*) exit 1 ;;
+		esac
+		if [[ $ev == digest ]]; then
+			printf '[%s] %s:\n%s' "$host" "$ev" "$text"
+		else
+			printf '[%s] %s: %s (%s)' "$host" "$ev" "$text" "$(t msg_footer "${CFG[mode]}" "${CFG[backend]:--}")"
+		fi
+	)
+}
+
+# ---- state: dedup, rate limit, queue ------------------------------------------------------
+# All of it lives under $NOTIFY_LOCK, held only for short file edits.
+text_key() { printf '%s' "$1" | sha256sum | cut -c1-24; }
+
+queue_len() { [[ -r $NOTIFY_QUEUE ]] && awk 'END { print NR }' "$NOTIFY_QUEUE" || printf '0\n'; }
+
+# notify_enqueue event text [force]: applies dedup + rate limit unless forced.
+notify_enqueue() {
+	local ev=$1 text=$2 force=${3:-0} now key id b64 cnt dedup limit qmax
+	now=$(date +%s)
+	dedup=$(dur2sec "${CFG[notify_dedup]}")
+	limit=${CFG[notify_rate_limit]}
+	qmax=${CFG[notify_queue_max]}
+	key=$(text_key "$ev|$text")
+	id="$now$RANDOM"
+	b64=$(printf '%s' "$text" | base64 -w0)
+	mkdir -p -- "$STATE_DIR"
+	(
+		flock 8
+		if ((force == 0)); then
+			# dedup: identical events are suppressed for notify_dedup
+			if [[ -r $NOTIFY_DEDUP ]]; then
+				awk -v n="$now" -v w="$dedup" '$1 > n - w' "$NOTIFY_DEDUP" >"$NOTIFY_DEDUP.new" && mv -f -- "$NOTIFY_DEDUP.new" "$NOTIFY_DEDUP"
+				awk -v k="$key" '$2 == k { f = 1 } END { exit !f }' "$NOTIFY_DEDUP" && exit 10
+			fi
+			printf '%s %s\n' "$now" "$key" >>"$NOTIFY_DEDUP"
+			# global limit per hour; the excess is only counted
+			if [[ -r $NOTIFY_RATE ]]; then
+				awk -v n="$now" '$1 > n - 3600' "$NOTIFY_RATE" >"$NOTIFY_RATE.new" && mv -f -- "$NOTIFY_RATE.new" "$NOTIFY_RATE"
+			fi
+			cnt=0
+			[[ -r $NOTIFY_RATE ]] && cnt=$(awk 'END { print NR }' "$NOTIFY_RATE")
+			if ((cnt >= limit)); then
+				printf '%s\n' "$(($(cat "$NOTIFY_SUPP" 2>/dev/null || printf 0) + 1))" >"$NOTIFY_SUPP"
+				exit 11
+			fi
+			printf '%s\n' "$now" >>"$NOTIFY_RATE"
+		fi
+		pending=""
+		[[ -n ${NCFG[telegram_token]} && -n ${NCFG[telegram_chat]} ]] && pending=telegram
+		if [[ -n ${NCFG[matrix_url]} && -n ${NCFG[matrix_token]} && -n ${NCFG[matrix_room]} ]] && have jq; then pending+=${pending:+,}matrix; fi
+		[[ -n $pending ]] || exit 12
+		printf '%s\t%s\t%s\t%s\n' "$id" "$now" "$pending" "$b64" >>"$NOTIFY_QUEUE"
+		# bounded queue: the oldest messages go first
+		if (($(awk 'END { print NR }' "$NOTIFY_QUEUE") > qmax)); then
+			tail -n "$qmax" "$NOTIFY_QUEUE" >"$NOTIFY_QUEUE.new" && mv -f -- "$NOTIFY_QUEUE.new" "$NOTIFY_QUEUE"
+		fi
+		exit 0
+	) 8>"$NOTIFY_LOCK"
+}
+
+# Deliver what is queued. One flusher at a time; the queue lock is never held during I/O.
+notify_flush() {
+	have curl || return 0
+	mkdir -p -- "$STATE_DIR"
+	exec 7>"$NOTIFY_FLUSH_LOCK"
+	flock -n 7 || return 0
+	ncfg_load || return 0
+	local now ttl limit cnt supp id ts pending b64 ch left text rc
+	local -a done_ids=() part=()
+	now=$(date +%s)
+	ttl=$(dur2sec "${CFG[notify_queue_ttl]}")
+	limit=${CFG[notify_rate_limit]}
+
+	# the "N notifications suppressed" message goes out once there is room again
+	supp=$(cat "$NOTIFY_SUPP" 2>/dev/null || printf 0)
+	if ((supp > 0)); then
+		cnt=0
+		[[ -r $NOTIFY_RATE ]] && cnt=$(awk -v n="$now" '$1 > n - 3600' "$NOTIFY_RATE" | awk 'END { print NR }')
+		if ((cnt < limit)); then
+			text=$( (i18n_load "$(notify_lang)"; printf '[%s] rate_limit: %s' "$(notify_host)" "$(t msg_suppressed "$supp")") )
+			(flock 8; rm -f -- "$NOTIFY_SUPP"; printf '%s\n' "$now" >>"$NOTIFY_RATE") 8>"$NOTIFY_LOCK"
+			notify_enqueue summary "$text" 1
+		fi
+	fi
+
+	[[ -r $NOTIFY_QUEUE ]] || return 0
+	local snap
+	snap=$(cat "$NOTIFY_QUEUE")
+	while IFS=$'\t' read -r id ts pending b64; do
+		[[ -n $id ]] || continue
+		if ((now - ts > ttl)); then done_ids+=("$id"); continue; fi
+		text=$(printf '%s' "$b64" | base64 -d 2>/dev/null) || { done_ids+=("$id"); continue; }
+		left=""
+		for ch in ${pending//,/ }; do
+			rc=1
+			case $ch in
+				telegram) send_telegram "$text"; rc=$? ;;
+				matrix) send_matrix "bb$id" "$text"; rc=$? ;;
+			esac
+			((rc == 0)) || left+=${left:+,}$ch
+		done
+		if [[ -z $left ]]; then done_ids+=("$id"); elif [[ $left != "$pending" ]]; then part+=("$id=$left"); fi
+	done <<<"$snap"
+	((${#done_ids[@]} + ${#part[@]} > 0)) || return 0
+	(
+		flock 8
+		[[ -r $NOTIFY_QUEUE ]] || exit 0
+		awk -F'\t' -v OFS='\t' -v done="${done_ids[*]}" -v part="${part[*]}" '
+			BEGIN { n = split(done, a, " "); for (i = 1; i <= n; i++) d[a[i]] = 1
+			        m = split(part, b, " "); for (i = 1; i <= m; i++) { split(b[i], kv, "="); p[kv[1]] = kv[2] } }
+			$1 in d { next }
+			$1 in p { $3 = p[$1] }
+			{ print }' "$NOTIFY_QUEUE" >"$NOTIFY_QUEUE.new" && mv -f -- "$NOTIFY_QUEUE.new" "$NOTIFY_QUEUE"
+	) 8>"$NOTIFY_LOCK"
+	return 0
+}
+
+# Run the flusher without holding anything of ours: the caller's lock (fd 9) is closed
+# in the child so a slow or dead network can never delay a firewall command.
+notify_kick() {
+	if [[ ${BB_TESTING:-} == 1 && ${BB_NOTIFY_SYNC:-} == 1 ]] || [[ ${NOTIFY_SYNC:-} == 1 ]]; then
+		notify_flush
+		return 0
+	fi
+	have curl || return 0
+	"$SELF" __notify-flush 9>&- </dev/null >/dev/null 2>&1 &
+	disown 2>/dev/null
+	return 0
+}
+
+notify_hook() { # "event k=v ..." [ready-made body]
+	local ev=${1%% *} rest="" text
+	[[ $1 == *" "* ]] && rest=${1#* }
+	[[ ${CFG[notify_enabled]:-no} == yes ]] || return 0
+	[[ ,${CFG[notify_events]}, == *,"$ev",* ]] || return 0
+	ncfg_load || return 0
+	[[ -n $(notify_channels) ]] || return 0
+	text=$(notify_compose "$ev" "$rest" "${2:-}") || return 0
+	notify_enqueue "$ev" "$text" 0 || return 0
+	notify_kick
+}
+
+# ---- keep the notification endpoints reachable ---------------------------------------------
+allow_union() { # fam -> manual allowlist plus generated entries
+	{ file_family "$ALLOW_FILE" "$1"; file_family "$NOTIFY_ALLOW_FILE" "$1"; } | sort -u
+}
+
+notify_allow_reload() { # push allow.list + generated entries into the live sets
+	local f
+	[[ -n $FW ]] && fw_live || return 0
+	mk_tmpdir
+	for f in $(fw_families); do
+		allow_union "$f" >"$TMPD/allow.live.$f"
+		set_replace allow "$f" "$TMPD/allow.live.$f" || true
+	done
+}
+
+notify_allow_refresh() { # best effort, needs DNS
+	local hosts="" h tmp
+	if ! ncfg_load || [[ ${CFG[notify_enabled]} != yes || ${CFG[notify_allow]} != yes ]]; then
+		[[ -e $NOTIFY_ALLOW_FILE ]] && { rm -f -- "$NOTIFY_ALLOW_FILE"; notify_allow_reload; }
+		return 0
+	fi
+	[[ -n ${NCFG[telegram_token]} ]] && hosts=api.telegram.org
+	if [[ -n ${NCFG[matrix_url]} ]]; then
+		h=${NCFG[matrix_url]#https://}
+		h=${h%%/*}
+		hosts+=" ${h%%:*}"
+	fi
+	mk_tmpdir
+	tmp=$TMPD/notify.allow
+	: >"$tmp"
+	for h in $hosts; do
+		timeout 5 getent ahosts "$h" 2>/dev/null | awk '{ print $1 }' | sort -u |
+			awk -v strip=0 -v minp4=0 -v minp6=0 -v hosts=0 -f "$AWK_NET" | awk -F'\t' '{ print $2 }' >>"$tmp"
+	done
+	[[ -s $tmp ]] || return 0 # keep the previous addresses when DNS fails
+	sort -u "$tmp" | write_atomic "$NOTIFY_ALLOW_FILE"
+	notify_allow_reload
+}
+
+# ---- daily digest ---------------------------------------------------------------------------
+digest_body() { # in the notification language; no addresses, no secrets
+	local out kind a b c f n line cur dp="" ev="" evn
+	out=$(fw_status 2>/dev/null)
+	(
+		i18n_load "$(notify_lang)"
+		t dg_mode "${CFG[mode]}" "${CFG[backend]}"; printf '\n'
+		line=""
+		while read -r kind a b c; do [[ $kind == set ]] && line+="$a=$b "; done <<<"$out"
+		t dg_sets "${line% }"; printf '\n'
+		declare -A prev=()
+		if [[ -r $DIGEST_SNAP ]]; then while read -r a b; do prev[$a]=$b; done <"$DIGEST_SNAP"; fi
+		while read -r kind a b c; do
+			[[ $kind == counter ]] || continue
+			cur=$b
+			n=$((cur - ${prev[$a]:-0}))
+			((n < 0)) && n=$cur # counters restart when the rules are rebuilt
+			dp+="$a=$n "
+		done < <(sort <<<"$out")
+		t dg_packets "${dp% }"; printf '\n'
+		line=""
+		for f in "$CACHE_DIR"/*.meta; do
+			[[ -e $f ]] || continue
+			a=$(basename -- "$f" .meta)
+			[[ $a =~ ^[a-z0-9][a-z0-9_-]{0,31}$ ]] || continue
+			line+="$a=$(list_meta_get "$a" count) "
+		done
+		[[ -r $DHT_CACHE ]] && line+="dht=$(awk 'END { print NR }' "$DHT_CACHE") "
+		t dg_lists "${line:--}"; printf '\n'
+		if have journalctl; then
+			for evn in guard_restored list_update_failed list_rejected; do
+				n=$(journalctl -t bb --since "24 hours ago" -o cat 2>/dev/null | grep -c "^$evn" || true)
+				ev+="$evn=${n:-0} "
+			done
+			t dg_events "${ev% }"
+		fi
+	)
+	# remember the counters for the next digest
+	while read -r kind a b c; do [[ $kind == counter ]] && printf '%s %s\n' "$a" "$b"; done <<<"$out" | write_atomic "$DIGEST_SNAP"
+}
+
+digest_timer_sync() {
+	have_systemd || return 0
+	if [[ ${CFG[notify_enabled]} == yes && ,${CFG[notify_events]}, == *,digest,* ]]; then
+		systemctl enable --now bb-digest.timer >/dev/null 2>&1
+	else
+		systemctl disable --now bb-digest.timer >/dev/null 2>&1
+	fi
+	return 0
+}
+
+cmd___digest() {
+	need_root; load_config require
+	notify_hook "digest" "$(digest_body)"
+}
+
+cmd___notify_flush() { need_root; cfg_load || true; notify_flush; }
+
+cmd___notify_event() { # ev [k=v ...]: used by bb-notify-failure@.service
+	[[ $# -ge 1 ]] || die err_usage __notify-event
+	need_root; load_config
+	notify_hook "$*"
+}
+
+# ---- CLI: bb notify ----------------------------------------------------------------------------
+read_secret() { # prompt-key -> value on stdout (silent on a terminal)
+	local v=""
+	if [[ -t 0 ]]; then read -r -s -p "$(t "$1") " v; printf '\n' >&2; else read -r v || true; fi
+	printf '%s\n' "$v"
+}
+
+read_plain() {
+	local v=""
+	if [[ -t 0 ]]; then read -r -p "$(t "$1") " v; else read -r v || true; fi
+	printf '%s\n' "$v"
+}
+
+telegram_detect_chat() { # needs jq; the user has written to the bot
+	have jq || die err_notify_jq Telegram
+	local cfg out
+	cfg=$(printf 'url = "https://api.telegram.org/bot%s/getUpdates"\n' "${NCFG[telegram_token]}"; notify_curl_common | grep -v '^output')
+	out=$(printf '%s\n' "$cfg" | curl -K - 2>/dev/null) || return 1
+	jq -r '[.result[]? | (.message // .channel_post // .my_chat_member // empty) | .chat.id] | last // empty' <<<"$out" 2>/dev/null
+}
+
+cmd_notify_setup() {
+	local ch=${1:-} v rc
+	need_root; take_lock; load_config
+	have curl || die err_tools_missing curl
+	ncfg_load || true
+	case $ch in
+		telegram)
+			v=$(read_secret notify_setup_token)
+			ncfg_valid telegram_token "$v" || die err_notify_bad_value token
+			NCFG[telegram_token]=$v
+			v=$(read_plain notify_setup_chat)
+			if [[ -z $v ]]; then
+				say notify_setup_chat_wait
+				[[ -t 0 ]] && read -r _
+				v=$(telegram_detect_chat) || v=""
+				[[ -n $v ]] || die err_notify_chat_detect
+			fi
+			ncfg_valid telegram_chat "$v" || die err_notify_bad_value chat
+			NCFG[telegram_chat]=$v ;;
+		matrix)
+			have jq || die err_notify_jq Matrix
+			v=$(read_plain notify_setup_url); v=${v%/}
+			ncfg_valid matrix_url "$v" || die err_notify_bad_value url
+			NCFG[matrix_url]=$v
+			v=$(read_secret notify_setup_mtoken)
+			ncfg_valid matrix_token "$v" || die err_notify_bad_value token
+			NCFG[matrix_token]=$v
+			v=$(read_plain notify_setup_room)
+			ncfg_valid matrix_room "$v" || die err_notify_bad_value room
+			NCFG[matrix_room]=$v ;;
+		*) die err_usage notify ;;
+	esac
+	CFG[notify_enabled]=yes # the test below needs the proxy setting, not the flag
+	say notify_testing
+	if [[ $ch == telegram ]]; then send_telegram "$(notify_compose test "")"; rc=$?; else send_matrix "$(notify_compose test "")"; rc=$?; fi
+	if ((rc != 0)); then
+		CFG[notify_enabled]=no
+		die err_notify_test_failed "$ch" "$rc"
+	fi
+	ncfg_save || die err_write "$NOTIFY_CONF"
+	cfg_save
+	notify_allow_refresh
+	digest_timer_sync
+	say notify_saved "$ch"
+}
+
+cmd_notify_test() {
+	need_root; load_config
+	have curl || die err_tools_missing curl
+	ncfg_load || die err_notify_none
+	local ch bad=0 rc txt
+	[[ -n $(notify_channels) ]] || die err_notify_none
+	txt=$(notify_compose test "")
+	for ch in $(notify_channels); do
+		if [[ $ch == telegram ]]; then send_telegram "$txt"; rc=$?; else send_matrix "$txt"; rc=$?; fi
+		if ((rc == 0)); then say notify_test_ok "$ch"; else warn warn_notify_test_failed "$ch" "$rc"; bad=1; fi
+	done
+	exit "$bad"
+}
+
+cmd_notify_status() {
+	need_root; load_config
+	local st=off ch
+	[[ ${CFG[notify_enabled]} == yes ]] && st=on
+	ncfg_load || true
+	say ns_state "$(t "word_$st")"
+	for ch in telegram matrix; do
+		if [[ $(notify_channels) == *"$ch"* ]]; then say ns_channel "$ch" "$(t word_configured)"; else say ns_channel "$ch" "$(t word_not_configured)"; fi
+	done
+	say ns_events "${CFG[notify_events]:--}"
+	say ns_queue "$(queue_len)" "$(cat "$NOTIFY_SUPP" 2>/dev/null || printf 0)"
+}
+
+cmd_notify() {
+	local sub=${1:-status}
+	[[ $# -gt 0 ]] && shift
+	case $sub in
+		setup) cmd_notify_setup "$@" ;;
+		test) cmd_notify_test "$@" ;;
+		status) cmd_notify_status "$@" ;;
+		enable)
+			need_root; take_lock; load_config
+			ncfg_load || die err_notify_none
+			[[ -n $(notify_channels) ]] || die err_notify_none
+			cfg_set notify_enabled yes; notify_allow_refresh; digest_timer_sync; say notify_enabled ;;
+		disable)
+			need_root; take_lock; load_config
+			cfg_set notify_enabled no; notify_allow_refresh; digest_timer_sync; say notify_disabled ;;
+		events)
+			need_root; take_lock; load_config
+			if [[ $# -eq 0 ]]; then say ns_events "${CFG[notify_events]:--}"; return 0; fi
+			local e
+			for e in ${1//,/ }; do [[ " $NOTIFY_EVENTS_ALL " == *" $e "* ]] || die err_notify_event "$e"; done
+			cfg_set notify_events "$1"; digest_timer_sync; say ns_events "${CFG[notify_events]:--}" ;;
+		*) die err_usage notify ;;
+	esac
+}
+
 # ---- install / uninstall -------------------------------------------------------
 OS_FAMILY="" OS_ID=""
 PLAN_BACKEND="" PLAN_PKGS=""
-UNIT_NAMES="bb-sets.service bb-firewall.service bb-update.service bb-update.timer bb-guard.service bb-guard.timer"
+UNIT_NAMES="bb-sets.service bb-firewall.service bb-update.service bb-update.timer bb-guard.service bb-guard.timer bb-digest.service bb-digest.timer bb-notify-failure@.service"
 
 os_info() { # sets OS_FAMILY (apt|dnf|unknown) and OS_ID
 	local line id="" like="" tok
@@ -1541,7 +2077,7 @@ ReadWritePaths=-/etc/bb -/var/lib/bb -/var/backups/bb /run
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_DAC_OVERRIDE CAP_FOWNER CAP_CHOWN'
 
 unit_text() { # name
-	local bin=$BIN_PATH wants="" guard
+	local bin=$BIN_PATH wants="" guard onfail="OnFailure=bb-notify-failure@%n.service"
 	guard=$(dur2sec "${CFG[guard_interval]}")
 	[[ ${CFG[backend]} == iptables ]] && wants="Wants=bb-sets.service"
 	case $1 in
@@ -1568,6 +2104,7 @@ EOF
 			cat <<EOF
 [Unit]
 Description=bb: apply blocking rules
+$onfail
 After=nftables.service netfilter-persistent.service iptables.service ip6tables.service ufw.service network-pre.target
 Before=docker.service k3s.service
 $wants
@@ -1586,6 +2123,7 @@ EOF
 			cat <<EOF
 [Unit]
 Description=bb: update blocklists and DHT nodes
+$onfail
 After=network-online.target
 Wants=network-online.target
 
@@ -1613,6 +2151,7 @@ EOF
 			cat <<EOF
 [Unit]
 Description=bb: make sure the rules are still in place
+$onfail
 
 [Service]
 Type=oneshot
@@ -1634,6 +2173,43 @@ AccuracySec=10s
 WantedBy=timers.target
 EOF
 			;;
+		bb-digest.service)
+			cat <<EOF
+[Unit]
+Description=bb: daily digest
+$onfail
+
+[Service]
+Type=oneshot
+ExecStart=$bin __digest
+$HARDEN
+EOF
+			;;
+		bb-digest.timer)
+			cat <<EOF
+[Unit]
+Description=bb: daily digest timer
+
+[Timer]
+OnCalendar=*-*-* 08:00:00
+RandomizedDelaySec=10m
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+			;;
+		bb-notify-failure@.service)
+			cat <<EOF
+[Unit]
+Description=bb: report the failure of %i
+
+[Service]
+Type=oneshot
+ExecStart=$bin __notify-event service_failed unit=%i
+$HARDEN
+EOF
+			;;
 		*) return 1 ;;
 	esac | awk 'NF || prev { print } { prev = NF }' # drop the blank line an empty $wants leaves
 }
@@ -1648,6 +2224,7 @@ units_install() {
 	done
 	[[ ${CFG[backend]} == iptables ]] || rm -f -- "$UNIT_DIR/bb-sets.service"
 	systemctl daemon-reload >/dev/null 2>&1 || true
+	digest_timer_sync
 	systemctl enable bb-firewall.service bb-update.timer bb-guard.timer >/dev/null 2>&1 || return 1
 	[[ ${CFG[backend]} == iptables ]] && { systemctl enable bb-sets.service >/dev/null 2>&1 || return 1; }
 	return 0
@@ -1853,7 +2430,8 @@ cmd_uninstall() {
 		read -r ans
 		[[ ${ans,,} == y || ${ans,,} == yes ]] || { say uninst_aborted; exit 1; }
 	fi
-	for u in bb-mode-rollback.timer bb-guard.timer bb-update.timer bb-firewall.service bb-sets.service bb-guard.service bb-update.service; do
+	NOTIFY_SYNC=1 log_event "uninstall purge=$purge"
+	for u in bb-mode-rollback.timer bb-guard.timer bb-update.timer bb-digest.timer bb-digest.service bb-firewall.service bb-sets.service bb-guard.service bb-update.service; do
 		systemctl stop "$u" >/dev/null 2>&1
 		systemctl disable "$u" >/dev/null 2>&1
 	done
@@ -1864,7 +2442,6 @@ cmd_uninstall() {
 	have nft && nft_remove
 	for u in $SAVED_RULE_FILES; do strip_saved_file "$u"; done
 	rm -f -- "$PENDING_FILE"
-	log_event "uninstall purge=$purge"
 	if ((purge)); then
 		safe_rm_dir "$CONF_DIR"; safe_rm_dir "$STATE_DIR"; safe_rm_dir "$BACKUP_DIR"
 		TMPD=""
@@ -1934,6 +2511,10 @@ main() {
 		__remove) cmd___remove "$@" ;;
 		__sets-restore) cmd___sets_restore "$@" ;;
 		__unit) cmd___unit "$@" ;;
+		notify) cmd_notify "$@" ;;
+		__notify-flush) cmd___notify_flush "$@" ;;
+		__notify-event) cmd___notify_event "$@" ;;
+		__digest) cmd___digest "$@" ;;
 		install) cmd_install "$@" ;;
 		uninstall) cmd_uninstall "$@" ;;
 		*) err err_unknown_cmd "$cmd"; usage main >&2; exit 1 ;;

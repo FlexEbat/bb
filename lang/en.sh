@@ -95,6 +95,7 @@ Usage: bb COMMAND [options]       (add --help to any command)
   ban IP|NET [--ttl 7d]       manual ban        unban IP|NET   remove a ban
   allow IP|NET [--rm]         never block this address
   list [add|update|rm]        external blocklists and DHT nodes
+  notify setup|test|status    Telegram / Matrix notifications
   lang [en|ru]                show or change the interface language
 
 Global option: --lang en|ru"
@@ -178,3 +179,64 @@ MSG[help_uninstall]="Usage: bb uninstall [--yes] [--purge]
 
 Removes bb rules, sets and units. Other firewall rules are left alone and saved rule files
 are cleaned of bb entries. --purge also deletes the configuration and state."
+
+MSG[err_notify_bad_value]="invalid %s"
+MSG[err_notify_chat_detect]="could not detect the chat ID (is jq installed, and did you write to the bot?)"
+MSG[err_notify_event]="unknown event '%s'"
+MSG[err_notify_jq]="jq is required for %s (install it with your package manager)"
+MSG[err_notify_none]="no notification channel is configured; run 'bb notify setup telegram|matrix'"
+MSG[err_notify_test_failed]="delivery to %s failed (curl exit %s); nothing was saved"
+MSG[warn_notify_test_failed]="delivery to %s failed (curl exit %s)"
+
+MSG[notify_setup_token]="Bot token:"
+MSG[notify_setup_chat]="Chat ID (leave empty to detect it after you write to the bot):"
+MSG[notify_setup_chat_wait]="Write any message to the bot now, then press Enter."
+MSG[notify_setup_url]="Homeserver URL (https://...):"
+MSG[notify_setup_mtoken]="Access token:"
+MSG[notify_setup_room]="Room ID (!id:server):"
+MSG[notify_testing]="Sending a test message..."
+MSG[notify_test_ok]="Delivered to %s."
+MSG[notify_saved]="Channel %s saved; notifications are enabled."
+MSG[notify_enabled]="Notifications enabled."
+MSG[notify_disabled]="Notifications disabled."
+
+MSG[word_on]="on"
+MSG[word_off]="off"
+MSG[word_configured]="configured"
+MSG[word_not_configured]="not configured"
+MSG[ns_state]="Notifications: %s"
+MSG[ns_channel]="Channel %s: %s"
+MSG[ns_events]="Events: %s"
+MSG[ns_queue]="Queue: %s, suppressed: %s"
+
+MSG[ev_mode_changed]="mode is now %s"
+MSG[ev_mode_reverted]="mode reverted to %s (block was not confirmed in time)"
+MSG[ev_guard_restored]="the rules were missing or displaced and have been restored"
+MSG[ev_list_update_failed]="download of list %s failed"
+MSG[ev_list_rejected]="list %s rejected: %s"
+MSG[ev_service_failed]="unit %s failed"
+MSG[ev_rate_limit]="the flow addition limit was reached"
+MSG[ev_integration_changed]="the integration allowlist was changed"
+MSG[ev_manual_change]="manual change: %s"
+MSG[ev_install]="bb installed, backend %s"
+MSG[ev_uninstall]="bb removed"
+MSG[ev_test]="notifications are working"
+MSG[rsn_empty]="no valid entries"
+MSG[rsn_shrunk]="shrank sharply"
+MSG[rsn_size]="too large"
+MSG[rsn_sha256]="checksum mismatch"
+MSG[msg_footer]="mode: %s, backend: %s"
+MSG[msg_suppressed]="suppressed notifications: %s"
+MSG[dg_mode]="Mode: %s, backend: %s"
+MSG[dg_sets]="Sets: %s"
+MSG[dg_packets]="Packets since the previous digest: %s"
+MSG[dg_lists]="Lists (entries): %s"
+MSG[dg_events]="Events in 24 h: %s"
+
+MSG[help_notify]="Usage: bb notify setup telegram|matrix | test | status | enable | disable | events [LIST]
+
+setup asks for the secrets (they are never shown or logged) and verifies them with a test
+message. Telegram needs no extra packages; Matrix needs jq and an unencrypted room.
+events shows or sets the enabled events (comma-separated): mode_changed, guard_restored,
+list_update_failed, list_rejected, service_failed, rate_limit, integration_changed,
+manual_change, digest, install, uninstall."

@@ -12,7 +12,12 @@ A lightweight, CLI-only tool that blocks BitTorrent, DHT and blocklisted IP rang
 > systemd units with ordering and hardening, self-check; `bb uninstall [--purge]` that only
 > removes bb objects and cleans saved rule files; an unconfirmed `block` mode is reverted
 > after a reboot).
-> Not yet: notifications, integrations, `bb doctor`, nDPId/listener, `--json`.
+> **Step 5 notifications** (`bb notify setup|test|status|enable|disable|events`): Telegram and
+> Matrix through `curl -K -` (secrets travel on stdin, never in the process list), Matrix JSON
+> built with `jq`, dedup and hourly limit, a bounded retry queue flushed by the guard timer,
+> best-effort background delivery that can never block a firewall command, `OnFailure=`
+> reporting, the notification endpoints kept in the allowlist, and a daily digest.
+> Not yet: integrations, `bb doctor`, nDPId/listener, `--json`.
 > Install the files with `make install`, then run `sudo bb install`.
 
 ## Features
@@ -110,7 +115,7 @@ sudo make test        # shellcheck + catalog lint + bats suite (needs root, uses
 The suite runs in a private network and mount namespace and exercises both backends with
 real traffic over a veth pair (manual bans, allowlist precedence, lists, DHT port modes,
 dynamic flows, guard recovery, coexistence with foreign rules). Dependencies: `bats`,
-`shellcheck`, `nft`, `iptables`, `ipset`, `iproute2`, `ping`, `nc`.
+`shellcheck`, `nft`, `iptables`, `ipset`, `iproute2`, `ping`, `nc`, `jq`.
 
 List sources may contain IPs, CIDRs, host names and tracker URLs
 (`udp://host:port/announce`); the host part is extracted and resolved.
