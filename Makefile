@@ -1,10 +1,13 @@
 PREFIX ?= /usr/local
 SHAREDIR ?= /usr/share/bb
 
-.PHONY: test lint install
+.PHONY: test lint spec install
 
 test:            ## full suite (needs root: runs in a private network namespace)
 	tests/run.sh
+
+spec:            ## check tech.md against the tests and the code (slices, deviation register)
+	tests/check-spec.sh
 
 lint:
 	shellcheck -x -S warning src/bb

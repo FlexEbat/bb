@@ -1,5 +1,14 @@
 # bb — a lightweight CLI blocker for BitTorrent, DHT and blocklists
 
+**Version: v2** (2026-11-05)
+
+**Status: under development.** Progress is tracked per slice in section 17; intentional differences between the code and this text are in section 18.
+
+Changelog:
+
+- v2 (2026-11-05): section 17 rewritten as slices with a status that is checked against the tests; new section 18, the deviation register; `bb uninstall` removes everything `bb` installed or configured, including the packages it added (sections 10, 11, 13, 16); verified facts about the nDPId event stream (sections 6.4, 11).
+- v1: the first version of the specification.
+
 ## 1. Purpose
 
 `bb` is a command-line tool for a Linux host or gateway that blocks BitTorrent traffic, DHT and addresses from arbitrary blocklists. Blocking is done in the kernel by the firewall that is already installed on the system. All that remains on the outside is one bash script, a small bash daemon (DPI only) and systemd units. Python and other interpreters are not needed.
@@ -92,6 +101,7 @@ Sets exist for each address family (4 and 6; IPv6 is enabled with `ipv6=yes`, on
 | Set | Contents | Purpose |
 |---|---|---|
 | `allow4/6` | addresses and networks | exceptions, never blocked |
+| `internal4/6` | container and pod networks | exempt only when both the source and the destination are in it (see D-001) |
 | `manual4/6` | addresses and networks, with timeout | manual bans |
 | `list4/6` | addresses and networks | external lists and trackers |
 | `dht4/6` | "address and port" pairs | DHT bootstrap nodes |
@@ -100,7 +110,7 @@ Sets exist for each address family (4 and 6; IPv6 is enabled with `ipv6=yes`, on
 Check order:
 
 1. loopback → pass;
-2. `allow` (by source and destination) → pass (leave the `bb` chain);
+2. `allow` (by source or destination) → pass (leave the `bb` chain); then `internal` (source and destination both in it) → pass (see D-001);
 3. `manual` → drop;
 4. `list` → drop;
 5. `dht` (UDP) → drop, taking the port mode into account (section 11);
@@ -166,14 +176,16 @@ List file format: one entry per line (IP or CIDR), lines starting with `#` and e
 
 List sanitizing: private and special-purpose ranges (RFC 1918, 100.64.0.0/10, loopback, link-local, ULA `fc00::/7`) are removed from external lists unless `strip_private=no`. This keeps container and cluster networks from being blocked.
 
+Entries broader than /8 (IPv4) or /16 (IPv6) are rejected, so that one bad line cannot block everything (see D-005).
+
 ## 8. Integrations
 
-General principle: `bb` does not modify the rules or configuration of Docker, k8s, ufw and firewalld. It (1) works in its own objects (the `BB_FILTER` chain in raw or the `inet bb` table), (2) adds the necessary subnets to `allow`, (3) checks compatibility with `bb doctor`. Management: `bb integrate auto|docker|k8s|ufw|firewalld|status`. The default mode is `auto` (detection at install time and refresh by the `bb-guard` timer).
+General principle: `bb` does not modify the rules or configuration of Docker, k8s, ufw and firewalld. It (1) works in its own objects (the `BB_FILTER` chain in raw or the `inet bb` table), (2) adds container and pod networks to `internal` and node addresses to `allow` (see D-001), (3) checks compatibility with `bb doctor`. Management: `bb integrate auto|docker|k8s|ufw|firewalld|status`. The default mode is `auto` (detection at install time and refresh by the `bb-guard` timer).
 
 ### 8.1. Docker
 
 - Docker (iptables) creates its own chains (`DOCKER`, `DOCKER-USER`, NAT) and puts some rules in raw. `bb` rules run before DNAT, so published ports and container traffic are blocked by the original address. Rules in `DOCKER-USER` are not used.
-- Docker network subnets (`docker0`, `br-*`) are added to `allow` automatically, detected from interfaces and, if available, via `docker network inspect`. The list is refreshed by a timer.
+- Docker network subnets (`docker0`, `br-*`) are added to `internal` automatically (see D-001), detected from interfaces and, if available, via `docker network inspect`. The list is refreshed by a timer.
 - On start and restart Docker may insert its own rules at the top of raw: this is covered by the position check (section 6.2). Restarting Docker does not remove the `bb` sets and chain.
 - `bb-firewall.service` starts before `docker.service` (ordering only, no hard dependency).
 
@@ -181,7 +193,7 @@ General principle: `bb` does not modify the rules or configuration of Docker, k8
 
 - `bb` is installed on each node separately. Centralized cluster management is out of scope.
 - kube-proxy modes (iptables, ipvs, nftables) do not matter: they have their own chains and tables.
-- Added to `allow`: pod CIDR, service CIDR and node IPs. Detection is automatic where possible: for k3s from `/etc/rancher/k3s/config.yaml` and `config.yaml.d/` (defaults 10.42.0.0/16 and 10.43.0.0/16), for kubeadm from the `kube-controller-manager` manifests, and node addresses if `kubectl` is available. Whatever cannot be detected is set manually (`k8s_pod_cidr`, `k8s_service_cidr`, `bb allow`).
+- Added to `internal` (see D-001): pod CIDR and service CIDR. Added to `allow`: node IPs. Detection is automatic where possible: for k3s from `/etc/rancher/k3s/config.yaml` and `config.yaml.d/` (defaults 10.42.0.0/16 and 10.43.0.0/16), for kubeadm from the `kube-controller-manager` manifests, and node addresses if `kubectl` is available. Whatever cannot be detected is set manually (`k8s_pod_cidr`, `k8s_service_cidr`, `bb allow`).
 - Internal traffic between nodes (API server, etcd, VXLAN/WireGuard CNI) flows between node addresses, which are in the allowlist.
 - NodePort and inbound traffic are visible by the original address before DNAT.
 - Calico and some other CNIs insert their rules at the top of raw: covered by the position check.
@@ -273,12 +285,16 @@ bb notify enable|disable
 bb show flows                    what was blocked by DPI
 bb log -f                        event log
 bb mode monitor|block [--confirm 60]
-bb uninstall
+bb uninstall [--yes] [--keep-packages]   remove everything bb installed or configured
 ```
+
+Additions to this list are recorded in D-004 (see D-004).
 
 General rules: commands that change the system require root; exit code 0 on success, non-zero on error with a message on stderr; every subcommand has `--help`; all state-changing commands take a lock (section 13); every command accepts the global `--lang en|ru` flag. `--json` mode is built with `jq`; if it is missing, an installation hint is printed.
 
-**`bb mode`**: `monitor` mode writes to the log and keeps counters but does not drop (the default after installation). With `bb mode block --confirm N` the mode rolls back to `monitor` if the administrator does not confirm it within N seconds (60 by default, rollback via a transient `systemd-run` timer).
+**`bb mode`**: `monitor` mode writes to the log and keeps counters but does not drop (the default after installation). With `bb mode block --confirm N` the mode rolls back to `monitor` if the administrator does not confirm it within N seconds (60 by default, rollback via a transient `systemd-run` timer). An unconfirmed `block` is also reverted after a reboot (see D-006).
+
+**`bb uninstall`** removes everything `bb` installed or configured, and nothing else: its systemd units and timers, its firewall objects (the `BB_FILTER` chain and ipset sets, or the `inet bb` table), the configuration, state and backups (`/etc/bb`, `/var/lib/bb`, `/var/backups/bb`), the `bb` and `bb-ndpid` users, the binaries (`bb`, `bb-ndpid`), the language catalogs, the lock, and the packages that `bb install` added. Packages are tracked in `/var/lib/bb/manifest` as the difference between the installed packages before and after each installation (dependencies included, including the build packages for nDPId); a package is kept, and reported, if removing it would also remove other software. `--keep-packages` leaves all packages alone. Saved rule files that referenced `bb` objects are re-saved without them. On a terminal the command asks for confirmation; without one it needs `--yes`.
 
 **`bb doctor`** checks: the selected backend and the presence of the required utilities and kernel modules; the iptables variant (nf_tables or legacy); the presence of the `bb` chain or table and the jump position; the state of units and timers; a non-empty allowlist (gateway, DNS, SSH IP); whether `nftables.service` is enabled and whether its configuration contains `flush ruleset`; the status of Docker, k3s/k8s, ufw, firewalld; on dnf systems, SELinux and recent AVC denials for `bb`; the permissions of `/etc/bb/notify.conf` and the notification queue size; the language catalogs (both present, selected language available).
 
@@ -332,7 +348,7 @@ Installation: `apt-get install -y <packages>` and `dnf install -y <packages>`. I
 - nDPId is not in the standard repositories, so it is built from source: `git clone --recursive`, `cmake -DBUILD_NDPI=ON -DBUILD_EXAMPLES=OFF`, `make -j"$(nproc)"`. The binary is copied to `/usr/local/bin/bb-ndpid` and the build directory is removed.
 - The version is pinned with the `NDPID_REF` variable (tag or commit). After the build the built commit is printed together with a hint on how to pin it.
 - If a ready binary already exists and runs (`-h` responds, no library loading errors), the build is skipped.
-- Build packages are installed only when DPI is enabled. apt: `build-essential git cmake gettext flex bison libtool autoconf automake pkg-config libpcap-dev libjson-c-dev libnuma-dev libpcre2-dev libmaxminddb-dev librrd-dev`. dnf: `gcc gcc-c++ make git cmake gettext flex bison libtool autoconf automake pkgconf-pkg-config libpcap-devel json-c-devel numactl-devel pcre2-devel libmaxminddb-devel rrdtool-devel` (the dnf list is refined by testing). They are not removed automatically because they may have been installed earlier.
+- Build packages are installed only when DPI is enabled. apt: `build-essential git cmake gettext flex bison libtool autoconf automake pkg-config libpcap-dev libjson-c-dev libnuma-dev libpcre2-dev libmaxminddb-dev librrd-dev`. dnf: `gcc gcc-c++ make git cmake gettext flex bison libtool autoconf automake pkgconf-pkg-config libpcap-devel json-c-devel numactl-devel pcre2-devel libmaxminddb-devel rrdtool-devel` (the dnf list is refined by testing). They are recorded in the manifest (section 10), so `bb uninstall` removes the ones that `bb` itself installed, unless something else depends on them.
 - The BPF filter flag is detected from the `nDPId -h` help output. If it is not found, a warning is printed and nDPId analyzes all traffic.
 - Cloning and building run with a progress indicator (a spinner and the percentage from cmake output); the full log is shown only on error.
 - The firewall is not changed until the build and installation have succeeded.
@@ -340,7 +356,7 @@ Installation: `apt-get install -y <packages>` and `dnf install -y <packages>`. I
 
 ### Backups and self-check
 
-`bb install` creates a timestamped backup (configs, units, `iptables-save`, `ipset save`, saved rule files) and finish with a verification: all sets exist; the DHT set is not empty; the chain has the flow and DHT rules; there is exactly one jump to the chain in `PREROUTING` and `OUTPUT`; no references to old objects remain; the required units are enabled. On success the backups are deleted (including leftovers from earlier failed attempts). On failure the backup is kept and the reason and its path are printed.
+`bb install` creates a timestamped backup (configs, units, `iptables-save`, `ipset save`, saved rule files) and finish with a verification: all sets exist; the DHT set is not empty (an empty set is only a warning, see D-002); the chain has the flow and DHT rules; there is exactly one jump to the chain in `PREROUTING` and `OUTPUT`; no references to old objects remain; the required units are enabled. On success the backups are deleted (including leftovers from earlier failed attempts). On failure the backup is kept and the reason and its path are printed.
 
 ## 12. Files and systemd units
 
@@ -351,8 +367,8 @@ Installation: `apt-get install -y <packages>` and `dnf install -y <packages>`. I
 | `/etc/bb/bb.conf` | configuration |
 | `/etc/bb/lists.d/` | descriptions of connected lists |
 | `/etc/bb/allow.list`, `/etc/bb/manual.list` | source data for the allowlist and manual bans |
-| `/etc/bb/notify.conf` | notification tokens and settings (root, 0600) |
-| `/var/lib/bb/` | list cache, copy of dynamic flows, notification queue |
+| `/etc/bb/notify.conf` | notification secrets: tokens, chat, homeserver, room (root, 0600); the other `notify_*` settings are in `bb.conf` (see D-003) |
+| `/var/lib/bb/` | list cache, copy of dynamic flows, notification queue, integration networks, `manifest` (what `bb` installed, for `bb uninstall`) |
 | `/var/backups/bb/` | rule backups (`iptables-save` for the chain or `nft list table`, ipset dump) |
 
 Main `bb.conf` parameters: `lang` (`en` or `ru`, chosen at install), `backend` (detected at install), `install_backend`, `mode`, `ipv6`, `hook_priority` (-310, nft only), `list_maxelem` (1048576), `flow_ttl` (24h), `flow_maxelem` (262144), `flow_dedup` (600), `max_event_size` (1048576), `min_list_ratio` (50), `strip_private` (yes), `integrations` (auto), `guard_interval`, `confirm_timeout` (60), `flow_rate_limit`, `notify_*` (section 9, including `notify_lang`).
@@ -379,12 +395,12 @@ Logging: through journald, `bb` events carry the tag `bb` (`journalctl -t bb`), 
 - a backup of the rules before any change and an automatic rollback on an apply error;
 - protection against an empty or sharply shrunk list;
 - confirmation of `block` mode with a rollback timer (section 10);
-- `bb uninstall` removes only `bb` objects (the jump and the `BB_FILTER` chain with the ipset sets, or the `inet bb` table) and its own units. The commands `iptables -F`, `iptables -t raw -F` and `nft flush ruleset` are never used anywhere, so that Docker, ufw, firewalld and kube-proxy are not affected;
+- the firewall objects are `bb`'s own (the jump and the `BB_FILTER` chain with the ipset sets, or the `inet bb` table). The commands `iptables -F`, `iptables -t raw -F` and `nft flush ruleset` are never used anywhere, so that Docker, ufw, firewalld and kube-proxy are not affected; `bb uninstall` removes only those objects;
 - **locking against parallel runs:** all state-changing commands run under `flock /run/bb.lock` (waiting up to 30 seconds) so that timers and manual commands do not change the rules at the same time;
 - **safe list downloads:** HTTPS only (including redirects), timeouts and retries, a file size limit, strict validation of every line; list contents are treated as untrusted and never executed; an optional `sha256=` in the list description;
 - **privileges and isolation:** the listener does not run as root (user `bb`), nDPId runs as a separate user; units use `NoNewPrivileges=yes`, `ProtectSystem=strict`, `ProtectHome=yes`, `PrivateTmp=yes`, minimal capabilities (`CAP_NET_ADMIN` for firewall work, `CAP_NET_RAW` for capture in nDPId), `ReadWritePaths` only for `/var/lib/bb`;
 - the nDPId socket is accessible to root only (`SocketMode=0600`);
-- `bb uninstall` does not remove packages (they may have been installed earlier and used by the system); if the saved rule files referenced `bb` objects, they are re-saved without those references;
+- `bb uninstall` removes everything `bb` installed or configured (section 10), including the packages it added unless other software depends on them; if the saved rule files referenced `bb` objects, they are re-saved without those references;
 - **notification secrets:** tokens only in `/etc/bb/notify.conf` (0600), not in the journal and not in the process list (section 9);
 - **SELinux** (dnf systems): operation is verified in enforcing mode, AVC denials are shown in `bb doctor`.
 
@@ -439,17 +455,298 @@ Acceptance criteria:
 - the token is not visible in `ps`, in the journal or in the output of `bb status`;
 - the language chosen at install time is stored and used everywhere: the whole interface, including `--help`, errors and notifications, is in that language with no mixing; `--json` output and exit codes are identical in both languages;
 - with Russian selected on a non-UTF-8 terminal `bb` warns and offers English instead of printing garbled text;
-- `bb uninstall` removes all `bb` objects and units, and the rest of the system's rules stay as they were.
+- `bb uninstall` removes everything `bb` installed or configured (units, rules, sets, configuration, state, users, binaries and the packages it added), and the rest of the system's rules stay as they were.
 
-## 17. Development order
+## 17. Stages and slices
 
-1. **Core:** the abstraction layer and backend detection, sets and rules for both backends, `bb ban/unban/allow`, `bb mode`, `bb apply`, `flock` locking, OS detection (apt/dnf), and the message catalog infrastructure (`t`, `en.sh`, `ru.sh`, parity and lint checks) so that no string is ever hard-coded.
-2. **Static lists:** download, validation, private-range sanitizing, atomic replacement, timer.
-3. **DHT nodes** as a separate example of such a list.
-4. **Installation and operation:** `bb install/uninstall`, installing missing packages, backup and automatic rollback, `bb-firewall.service`, `bb-guard.timer`, `block` mode confirmation, the install wizard (including language selection), self-check.
-5. **Notifications:** `bb notify`, Telegram and Matrix via `curl`, the queue, flood protection, `OnFailure=`, the digest.
-6. **Integrations:** Docker, k3s/k8s, ufw, firewalld, `bb integrate`, `bb doctor`.
-7. **nDPId and the bash listener (with `jq`):** dynamic flows (optional), building nDPId and detecting the BPF flag, the listener socket unit, verifying the event format on a pinned version, unit hardening.
-8. **Quality:** `--json`, `bb log`, tests and the distribution matrix.
+The work is split into vertical slices, done in order. A slice is closed when every criterion of it is `[x]`.
 
-The system becomes useful as early as step 2, without nDPId.
+**Format.** `### Slice <label>: title`, with **Files**, **What it does**, **Acceptance criteria** (a numbered list, the criterion ID is `S<label>.<number>`), **Tests** and **Not to do**.
+
+**Markers.** `[x]` done: implemented and verified by the tests it cites, as `(tests/<file>: <part of the test name>)`, or marked `(manual)`. `[~]` implemented, but a part could not be verified yet (the line says what). `[ ]` not done.
+
+**Rules.**
+
+- The cited tests are checked by `tests/check-spec.sh` (also part of `make test`): the file must exist, the test name part must be in it, a `[x]` criterion without a test fails, and the status table below must equal the one computed from the criteria. The table is never edited by hand: run `tests/check-spec.sh --table`.
+- Where the implementation deliberately differs from this file, the difference is recorded in the deviation register (section 18) and not left implicit.
+- Stages: 1. core (S1); 2. lists (S2, S3); 3. installation, notifications, integrations (S4, S5, S6); 4. dynamic layer (S7); 5. machine-readable output and logs (S8); 6. test matrix (S9); 7. documentation and release (S10).
+
+| Slice | Title | Status | Criteria |
+|---|---|---|---|
+| S1 | Core | partial | 15/17 |
+| S2 | Static lists | partial | 8/9 |
+| S3 | DHT nodes | done | 4/4 |
+| S4 | Installation and operation | partial | 15/16 |
+| S5 | Notifications | partial | 11/12 |
+| S6 | Integrations and diagnostics | partial | 8/9 |
+| S7 | Dynamic layer (nDPId and the listener) | remaining | 0/14 |
+| S8 | Machine-readable output and logs | remaining | 0/3 |
+| S9 | Test matrix and CI | remaining | 0/7 |
+| S10 | Documentation and release | partial | 2/4 |
+
+---
+
+### Slice 1: Core
+
+**Files:** `src/bb`, `lang/en.sh`, `lang/ru.sh`, `src/net.awk`, `tests/backend.bats`, `tests/cli.bats`.
+
+**What it does:** backend detection and the abstraction layer, sets and rules for both backends, `bb ban/unban/allow`, `bb mode`, `bb apply`, `bb guard`, `flock` locking, the message catalogs.
+
+**Acceptance criteria:**
+
+1. [x] **S1.1** The backend follows section 3 and only missing packages are installed. (tests/install.bats: packages: nft path installs exactly the missing logical packages) (tests/install.bats: backend: iptables without the nftables package is used as is)
+2. [x] **S1.2** A manual ban passes in `monitor` mode (counted), is dropped in `block` mode, and `unban` restores traffic. (tests/backend.bats: manual ban: monitor passes, block drops, unban restores)
+3. [x] **S1.3** The allowlist always beats a broader ban. (tests/backend.bats: allowlist beats a broader ban)
+4. [x] **S1.4** Both directions are blocked (traffic to and from a banned address) and loopback is never touched. (tests/backend.bats: inbound traffic from a banned peer is dropped) (tests/backend.bats: loopback is never touched)
+5. [x] **S1.5** A ban TTL expires on its own and survives a rebuild of the rules. (tests/backend.bats: ban TTL expires and the file is pruned) (tests/backend.bats: ban with TTL survives a rebuild)
+6. [x] **S1.6** Entries are validated and canonicalized (IPv4/IPv6, host bits cleared); invalid and too broad entries are rejected (see D-005). (tests/cli.bats: norm: networks are canonicalized) (tests/cli.bats: norm: invalid and too-broad entries are rejected)
+7. [x] **S1.7** `bb guard` restores wiped rules and a displaced jump, and repeated `apply` never duplicates it. (tests/backend.bats: guard restores wiped rules) (tests/backend.bats: guard puts a displaced jump back in first place)
+8. [x] **S1.8** A failing apply leaves the running protection in place. (tests/backend.bats: a failing apply keeps the running protection)
+9. [x] **S1.9** Foreign rules coexist: a foreign `ACCEPT` at the top of `raw` cannot shield blocked traffic, and removal touches only `bb` objects. (tests/backend.bats: foreign ACCEPT at the top of raw cannot shield blocked traffic) (tests/backend.bats: removal touches only bb objects)
+10. [x] **S1.10** State-changing commands take a lock: a second command waits and then fails with a message. (tests/cli.bats: locking: a second state-changing command waits for the lock)
+11. [x] **S1.11** The configuration is read by a strict parser that never executes it, and written atomically with mode 0600. (tests/cli.bats: config: strict parser ignores junk lines) (tests/cli.bats: config file is mode 0600 and written atomically)
+12. [x] **S1.12** `bb mode block --confirm` arms a rollback timer, refuses without `systemd-run`, and an unconfirmed block is reverted after a reboot (see D-006). (tests/backend.bats: block --confirm arms a rollback timer) (tests/backend.bats: block --confirm without systemd-run refuses) (tests/install.bats: an unconfirmed block mode is reverted by apply/guard)
+13. [x] **S1.13** The language is chosen by flag, `BB_LANG`, `bb.conf`, then English; Russian falls back to English on a non-UTF-8 locale; catalogs have the same keys and placeholders and no string is hard-coded. (tests/cli.bats: language: precedence flag > BB_LANG > bb.conf > en) (tests/cli.bats: language: Russian on a non-UTF-8 locale) (tests/lint.sh: placeholder mismatch)
+14. [x] **S1.14** In the `nft` backend a changed `hook_priority` recreates the base chains. (tests/backend.bats: changed hook_priority recreates the base chains)
+15. [x] **S1.15** No interpreter (Python, Perl, Ruby, Node) is used by the product. (tests/lint.sh: no interpreters)
+16. [~] **S1.16** IPv6 blocking works. The sets and rules are created and loaded, but the traffic test skips itself in an environment without IPv6. (tests/backend.bats: ipv6 ban)
+17. [~] **S1.17** Both `iptables` variants work. Only `nf_tables` has been run; the `legacy` variant is covered by slice 9.
+
+**Tests:** `tests/backend.bats` (real traffic between two network namespaces on both backends), `tests/cli.bats`, `tests/lint.sh`.
+
+**Not to do:** a web panel, a database, any heavy IDS.
+
+---
+
+### Slice 2: Static lists
+
+**Files:** `src/bb`, `src/net.awk`, `tests/cli.bats`, `tests/backend.bats`.
+
+**What it does:** `bb list add|update|rm`, download, validation, private-range sanitizing, atomic replacement, the daily timer.
+
+**Acceptance criteria:**
+
+1. [x] **S2.1** Only HTTPS sources are accepted, including redirects, with timeouts and a size limit. (tests/cli.bats: lists: only https sources, valid names, sha256 format) (tests/cli.bats: lists: https download goes through curl with https-only protocol flags)
+2. [x] **S2.2** List content is untrusted: every line is validated, private and special ranges are dropped, nothing is executed. (tests/cli.bats: lists: strict sanitizing of untrusted content) (tests/cli.bats: lists: strip_private=no keeps private ranges)
+3. [x] **S2.3** An empty, sharply shrunk or vanished source keeps the old set. (tests/backend.bats: list: empty, shrunk and vanished sources keep the old set)
+4. [x] **S2.4** An oversized list is rejected, and a `sha256=` mismatch keeps the old data. (tests/cli.bats: lists: size limit rejects oversized lists) (tests/cli.bats: lists: sha256 mismatch keeps the old data and fails)
+5. [x] **S2.5** Host names in a list are resolved, private resolutions and junk are dropped. (tests/cli.bats: lists: hosts are resolved, private resolutions dropped, junk hosts ignored)
+6. [x] **S2.6** An IP from a list is unreachable in `block` mode and reachable in `monitor` mode. (tests/backend.bats: list: monitor passes, block drops, removal restores)
+7. [x] **S2.7** Overlapping and duplicate networks from several lists load on both backends. (tests/backend.bats: list: overlapping and duplicate networks load)
+8. [x] **S2.8** The daily update timer is installed and its ordering is valid. (tests/install.bats: units: syntax and ordering verified by systemd-analyze)
+9. [~] **S2.9** The `wget` download path works. Only the `curl` path is exercised by tests.
+
+**Tests:** `tests/cli.bats`, `tests/backend.bats`.
+
+**Not to do:** list formats other than one entry per line (IP, CIDR, host name or tracker URL).
+
+---
+
+### Slice 3: DHT nodes
+
+**Files:** `src/bb`, `tests/backend.bats`.
+
+**What it does:** bootstrap nodes (`name:port`) resolved by the update timer into the `dht` sets, blocked by the port mode.
+
+**Acceptance criteria:**
+
+1. [x] **S3.1** Node names are resolved, private and unresolvable ones are dropped. (tests/backend.bats: dht: host names resolved, private and unresolvable dropped)
+2. [x] **S3.2** A resolution that returns nothing keeps the previous set. (tests/backend.bats: dht: empty resolution keeps the old set)
+3. [x] **S3.3** The port modes `all`, `only` and `except` block as specified on both backends. (tests/backend.bats: dht: all / except / only port modes)
+4. [x] **S3.4** A default node list is created at install. (tests/install.bats: install (nft): config, allowlist, rules in monitor mode, units, no leftovers)
+
+**Tests:** `tests/backend.bats`.
+
+**Not to do:** resolving through anything but the system resolver.
+
+---
+
+### Slice 4: Installation and operation
+
+**Files:** `src/bb`, `tests/install.bats`.
+
+**What it does:** `bb install` (wizard, platform check, package plan, backup, allowlist auto-fill, units, self-check), `bb uninstall`, the units and timers, `block` confirmation after a reboot.
+
+**Acceptance criteria:**
+
+1. [x] **S4.1** Arguments are validated before anything changes. (tests/install.bats: arguments are validated before anything changes)
+2. [x] **S4.2** An unsupported distribution stops the install unless `--force`. (tests/install.bats: platform: unknown distribution stops unless --force)
+3. [x] **S4.3** A failing package installation changes nothing, and what was installed is recorded for the uninstall. (tests/install.bats: packages: a failing install changes nothing) (tests/install.bats: a failed package installation is still recorded so that uninstall can clean it up)
+4. [x] **S4.4** A backup is made before any change, kept (with its path) when the self-check fails, and dropped on success. (tests/install.bats: failed self-check keeps the backup and says where it is) (tests/install.bats: install (nft): config, allowlist, rules in monitor mode, units, no leftovers)
+5. [x] **S4.5** The allowlist is filled with the gateway, DNS servers and the current SSH client. (tests/install.bats: install (nft): config, allowlist, rules in monitor mode, units, no leftovers)
+6. [x] **S4.6** Units carry the specified ordering and are valid for `systemd-analyze`; the sets unit exists for the `iptables` backend only. (tests/install.bats: units: syntax and ordering verified by systemd-analyze) (tests/install.bats: install (iptables): sets service is created and wired in)
+7. [x] **S4.7** Installing again keeps bans and the allowlist and creates no duplicates. (tests/install.bats: install is repeatable: keeps bans and allowlist, no duplicates)
+8. [x] **S4.8** After a boot the sets come from the cache without network access, before any rule. (tests/install.bats: boot path: __sets-restore recreates sets and bans without any rules)
+9. [x] **S4.9** An empty DHT set at the end of the install is a warning, not a failure (see D-002). (tests/install.bats: install without working DNS still completes)
+10. [x] **S4.10** The port-mode flags reach the configuration and the rules. (tests/install.bats: port mode flags end up in the config and in the rules)
+11. [x] **S4.11** The installer output is fully localized. (tests/install.bats: install output is fully Russian with --lang ru)
+12. [x] **S4.12** `bb uninstall` removes everything `bb` installed or configured: units, rules and sets, configuration, state, backups, binaries and the lock, and touches no other firewall object. (tests/install.bats: uninstall removes everything of bb, only bb objects of the firewall, and cleans saved rule files)
+13. [x] **S4.13** `bb uninstall` removes the packages `bb` installed, dependencies included, and keeps any package whose removal would also remove other software. (tests/install.bats: uninstall (apt) removes the packages bb installed, dependencies included, and nothing else) (tests/install.bats: uninstall keeps a package other software depends on, and says so) (tests/install.bats: uninstall (dnf) keeps packages that other installed software requires)
+14. [x] **S4.14** Saved rule files that referenced `bb` objects are re-saved without them. (tests/install.bats: uninstall removes everything of bb, only bb objects of the firewall, and cleans saved rule files)
+15. [x] **S4.15** `bb uninstall` asks for confirmation on a terminal and needs `--yes` otherwise. (tests/install.bats: uninstall needs --yes without a terminal)
+16. [~] **S4.16** The units start under a real systemd. They are only checked with `systemd-analyze` and stubs here; covered by slice 9.
+
+**Tests:** `tests/install.bats`.
+
+**Not to do:** touching the rules of other tools, flushing a ruleset.
+
+---
+
+### Slice 5: Notifications
+
+**Files:** `src/bb`, `tests/notify.bats`.
+
+**What it does:** `bb notify`, Telegram and Matrix through `curl`, the queue, flood protection, `OnFailure=`, the digest.
+
+**Acceptance criteria:**
+
+1. [x] **S5.1** Setup is verified with a test message and saves nothing when it fails; bad input is rejected before any network call. (tests/notify.bats: setup rejects bad input before touching the network)
+2. [x] **S5.2** Secrets live in `notify.conf` (root, 0600) and never appear in the process list, output, status or journal (see D-003). (tests/notify.bats: secrets never appear in the process list, output, status or journal) (tests/notify.bats: telegram setup: verified with a test message, secrets only in notify.conf)
+3. [x] **S5.3** Values are quoted for the curl configuration and event data cannot inject into messages. (tests/notify.bats: curl config quoting: quotes, backslashes and newlines cannot break out of a value) (tests/notify.bats: untrusted event data cannot inject into messages or curl config)
+4. [x] **S5.4** Matrix messages use a bearer header, an encoded room and valid JSON. (tests/notify.bats: matrix: PUT with bearer header, room encoded, JSON built by jq) (tests/notify.bats: matrix messages are valid JSON even for multi-line bodies)
+5. [x] **S5.5** Only the enabled events are sent; manual changes never carry the address. (tests/notify.bats: events: only the enabled ones are sent; manual changes never carry the address)
+6. [x] **S5.6** Identical events are suppressed for `notify_dedup`, and an hourly limit sends one summary message. (tests/notify.bats: flood protection: identical events are suppressed for notify_dedup) (tests/notify.bats: flood protection: global hourly limit, one summary message afterwards)
+7. [x] **S5.7** Undelivered messages are queued, retried, expired and bounded, with per-channel progress. (tests/notify.bats: queue: undelivered messages are kept and retried) (tests/notify.bats: queue: expired messages are discarded, not sent) (tests/notify.bats: queue: bounded, the oldest messages are dropped first)
+8. [x] **S5.8** Delivery runs in the background: a dead network never delays or fails a firewall command. (tests/notify.bats: delivery is in the background)
+9. [x] **S5.9** The notification endpoints stay in the allowlist. (tests/notify.bats: notification endpoints are allowlisted)
+10. [x] **S5.10** The guard retries the queue; a failed `bb` unit is reported through `OnFailure=`; the digest holds no addresses. (tests/notify.bats: guard retries the queue and reports restored rules) (tests/notify.bats: units: failure hook and digest are wired) (tests/notify.bats: daily digest: modes, sets, packets since last time, list sizes; no addresses)
+11. [x] **S5.11** Notification texts follow `notify_lang`, event identifiers stay English; a proxy can be set. (tests/notify.bats: mode change notification, in English and in Russian) (tests/notify.bats: proxy is passed in the curl config and validated)
+12. [~] **S5.12** The live Telegram and Matrix APIs accept the requests. Only a stubbed `curl` is used here.
+
+**Tests:** `tests/notify.bats`.
+
+**Not to do:** end-to-end encrypted Matrix rooms, other channels.
+
+---
+
+### Slice 6: Integrations and diagnostics
+
+**Files:** `src/bb`, `tests/integrations.bats`.
+
+**What it does:** `bb integrate`, the `internal` sets (see D-001), `bb doctor`.
+
+**Acceptance criteria:**
+
+1. [x] **S6.1** Docker networks come from `docker0`, `br-*` and `docker network inspect`, IPv6 included. (tests/integrations.bats: docker0 and br-* networks go to the internal set) (tests/integrations.bats: docker network inspect adds subnets, IPv6 included)
+2. [x] **S6.2** k3s (every configuration form and its defaults), kubeadm manifests and manual settings are understood. (tests/integrations.bats: k3s config: inline, quoted, dual-stack, list form and config.d are all understood) (tests/integrations.bats: k3s defaults, kubeadm manifests and manual settings)
+3. [x] **S6.3** Containers and pods reach each other but not blocked addresses (see D-001). (tests/integrations.bats: containers/pods talk to each other, but not to blocked addresses)
+4. [x] **S6.4** Node addresses join the allowlist and beat a ban. (tests/integrations.bats: node addresses (kubectl) join the allowlist and beat a ban)
+5. [x] **S6.5** The guard picks up new networks, a reboot loads them from the cache, and a change is announced once. (tests/integrations.bats: guard picks up new Docker networks) (tests/integrations.bats: after a reboot the internal networks load from the cache) (tests/integrations.bats: integration changes are announced once)
+6. [x] **S6.6** `bb integrate` selects, disables and reports integrations (see D-004); ufw and firewalld are reported and never modified. (tests/integrations.bats: bb integrate: selection, none, auto, errors and status) (tests/integrations.bats: ufw and firewalld are reported, never modified)
+7. [x] **S6.7** `bb doctor` reports each area and exits 1 on a failure. (tests/integrations.bats: doctor: healthy system exits 0 and reports each area) (tests/integrations.bats: doctor: wiped rules are a FAIL)
+8. [x] **S6.8** `bb doctor` calls out `flush ruleset` in `nftables.service`, other firewall tools, SELinux denials, saved rule files, file permissions and the queue. (tests/integrations.bats: doctor: nftables.service with 'flush ruleset' is called out) (tests/integrations.bats: doctor: other firewall tools and integrations are listed) (tests/integrations.bats: doctor: saved rule files that mention bb objects) (tests/integrations.bats: doctor: notify.conf permissions, queue size and no secrets in the output)
+9. [~] **S6.9** Docker, k3s, ufw and firewalld behave as modelled. They are stubbed here; restart and reload scenarios are covered by slice 9.
+
+**Tests:** `tests/integrations.bats`.
+
+**Not to do:** changing the rules or configuration of Docker, k8s, ufw or firewalld; centralized cluster management.
+
+---
+
+### Slice 7: Dynamic layer (nDPId and the listener)
+
+**Files:** `src/bb`, `tests/dpi.bats`, `tests/fixtures/`.
+
+**What it does:** builds nDPId from a pinned reference, the listener (bash and `jq`) behind a socket unit, dynamic flows in `flow` sets, `bb show flows`.
+
+**Acceptance criteria:**
+
+1. [ ] **S7.1** nDPId is built from a pinned reference and installed as `bb-ndpid`.
+2. [ ] **S7.2** The BPF flag is detected from `-h`; the port mode produces the capture filter.
+3. [ ] **S7.3** The listener parses frames of the real nDPId stream and survives invalid, truncated and oversized frames.
+4. [ ] **S7.4** Only `detected` and `detection-update` BitTorrent events become flows.
+5. [ ] **S7.5** Hostile or malformed fields never reach a command.
+6. [ ] **S7.6** Private and allowlisted addresses never enter `flow`.
+7. [ ] **S7.7** Repeated events are deduplicated and memory stays bounded.
+8. [ ] **S7.8** Exceeding the rate limit pauses the listener and raises `rate_limit`.
+9. [ ] **S7.9** Flows block by tuple on both backends.
+10. [ ] **S7.10** The listener runs without root, with only `CAP_NET_ADMIN`.
+11. [ ] **S7.11** Dynamic flows survive a restart.
+12. [ ] **S7.12** `bb show flows` lists them.
+13. [ ] **S7.13** A live capture through the real nDPId ends in a blocked flow.
+14. [ ] **S7.14** `bb uninstall` removes everything of the dynamic layer.
+
+**Tests:** `tests/dpi.bats`, `tests/fixtures/ndpid-1.7.raw` (a stream recorded from the real nDPId).
+
+**Not to do:** Python, the nDPIsrvd daemon, parsing JSON in bash or `awk`.
+
+---
+
+### Slice 8: Machine-readable output and logs
+
+**Files:** `src/bb`, `tests/json.bats`.
+
+**What it does:** `--json` for `bb status` and `bb doctor`, `bb log -f`.
+
+**Acceptance criteria:**
+
+1. [ ] **S8.1** `bb status --json` and `bb doctor --json` are valid JSON with stable keys and untranslated values.
+2. [ ] **S8.2** Without `jq` a hint is printed and the exit code is non-zero.
+3. [ ] **S8.3** `bb log -f` merges the journal tag `bb` and the kernel messages with the prefix `bb:`.
+
+**Tests:** `tests/json.bats`.
+
+**Not to do:** a separate log file or rotation.
+
+---
+
+### Slice 9: Test matrix and CI
+
+**Files:** `.github/workflows/`, `tests/matrix/`.
+
+**What it does:** runs the suite on the supported distributions and exercises what the sandbox cannot.
+
+**Acceptance criteria:**
+
+1. [ ] **S9.1** The suite passes on Debian, Ubuntu, and on the RHEL family and Fedora.
+2. [ ] **S9.2** The `iptables` `legacy` variant passes.
+3. [ ] **S9.3** The units start under a real systemd, and a reboot restores the rules.
+4. [ ] **S9.4** SELinux enforcing mode raises no AVC denial for `bb`.
+5. [ ] **S9.5** Docker and k3s restarts do not remove the `bb` rules.
+6. [ ] **S9.6** IPv6 traffic is blocked on a host with IPv6.
+7. [ ] **S9.7** The `wget` download path works.
+
+**Tests:** CI jobs.
+
+**Not to do:** support for distributions outside the two families.
+
+---
+
+### Slice 10: Documentation and release
+
+**Files:** `README.md`, `LICENSE`, `CHANGELOG.md`.
+
+**What it does:** the user documentation and the release.
+
+**Acceptance criteria:**
+
+1. [x] **S10.1** The README states `Status: under development`, names the license, and does not point to this file. (tests/spec.bats: README)
+2. [x] **S10.2** The repository carries the MIT license. (tests/spec.bats: license)
+3. [ ] **S10.3** `CHANGELOG.md` follows Keep a Changelog.
+4. [ ] **S10.4** A tag produces a release with checksums, and the version in the CHANGELOG and in the tag agree.
+
+**Tests:** `tests/spec.bats`.
+
+**Not to do:** a documentation site.
+
+---
+
+## 18. Deviation register
+
+A deviation is a place where the implementation deliberately does something other than what this file says. It is recorded here instead of being left implicit.
+
+**Rules.**
+
+1. Every deviation has a sequential ID `D-NNN`, the section(s) it concerns, what is done instead, why, a status, and the test that verifies the behavior that is actually implemented.
+2. The affected text in this file carries `(see D-NNN)`, and the code that deviates carries a `# D-NNN` comment. `tests/check-spec.sh` checks both directions: an active deviation must be annotated, cited by a real test and anchored in `src/` or `tests/`, and no ID may appear anywhere in the repository without an entry here.
+3. A deviation is `active` while the difference exists. When this file is changed to say what the code does (or the code is changed back), the entry becomes `resolved` and stays for history; a resolved entry needs no annotation or test.
+4. Until the owner folds it into the text above, the register wins for the behavior it describes.
+
+| ID | Spec | Deviation | Reason | Status | Verified by |
+|---|---|---|---|---|---|
+| D-001 | §6.1, §8 | Container and pod networks (Docker, k3s/k8s) go to separate `internal4/6` sets that exempt a packet only when both its source and its destination are internal. The text adds them to `allow`, which passes a packet when either end matches. Node addresses stay in `allow`. | Taken literally the text would exempt a container that talks to a blocked address, which contradicts the acceptance criterion that traffic from containers and pods to blocked addresses is dropped while traffic between them passes. | active | (tests/integrations.bats: containers/pods talk to each other, but not to blocked addresses) |
+| D-002 | §11 | An empty DHT set at the end of `bb install` is a warning in the self-check, not a failure. | An install on a host without working DNS must still complete; `bb list update dht` fills the set later. | active | (tests/install.bats: install without working DNS still completes) |
+| D-003 | §9, §12 | Only the notification secrets (tokens, chat, homeserver, room) are stored in `notify.conf`; the other `notify_*` settings live in `bb.conf`. | The text puts "tokens and settings" in `notify.conf` and also lists `notify_*` among the `bb.conf` parameters. Splitting keeps the secrets file minimal and everything else readable. | active | (tests/notify.bats: telegram setup: verified with a test message, secrets only in notify.conf) |
+| D-004 | §10 | Additions to the CLI: `bb allow <net> --rm`, `bb list` without arguments (shows the lists), `bb notify events [LIST]`, `bb integrate none` and `bb integrate <name>`, `bb uninstall --keep-packages`, and internal commands starting with `__` that units and tests call. | Without them the allowlist could not shrink, the lists could not be inspected, and the units had nothing to call. | active | (tests/cli.bats: ban/unban/allow edit the source files; ban is idempotent) (tests/integrations.bats: bb integrate: selection, none, auto, errors and status) (tests/install.bats: uninstall --keep-packages leaves packages alone) |
+| D-005 | §6.1, §7 | Entries broader than /8 (IPv4) or /16 (IPv6) are rejected in lists and in manual bans and allowlist entries. | One bad line such as `0.0.0.0/0` must not be able to block everything. | active | (tests/cli.bats: norm: invalid and too-broad entries are rejected) |
+| D-006 | §10, §13 | An unconfirmed `block` mode is also reverted after a reboot: a marker is kept while the rollback timer runs, and `apply` and `guard` revert the mode when the timer is gone. | The rollback timer is transient and does not survive a reboot, so a host rebooted inside the confirmation window would stay in an unconfirmed `block`. | active | (tests/install.bats: an unconfirmed block mode is reverted by apply/guard when the timer is gone) |

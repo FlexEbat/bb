@@ -164,10 +164,12 @@ MSG[inst_units]="systemd units installed and enabled."
 MSG[inst_check_ok]="Self-check passed."
 MSG[inst_done]="bb is installed in monitor mode (it logs and counts, nothing is dropped). Look at 'bb status', then run 'bb mode block --confirm 60'."
 
-MSG[uninst_confirm]="Remove all bb rules, sets and units? [y/N]"
+MSG[uninst_confirm]="Remove bb completely (rules, sets, units, configuration, state, users and the packages bb installed)? [y/N]"
+MSG[uninst_pkg_removed]="Removed the packages bb had installed: %s"
+MSG[uninst_pkg_kept]="Kept the packages bb had installed (%s) because removing them would also remove: %s"
+MSG[warn_pkg_remove]="could not remove the packages: %s"
 MSG[uninst_aborted]="Aborted."
-MSG[uninst_done]="bb removed. Configuration kept in %s (use --purge to delete it too)."
-MSG[uninst_purged]="bb removed completely."
+MSG[uninst_done]="bb has been removed completely."
 MSG[uninst_resaved]="Saved rules file %s no longer mentions bb."
 
 MSG[help_install]="Usage: bb install [--backend iptables|nft] [--iface IF] [--ports-mode all|only|except] [--ports LIST]
@@ -176,10 +178,11 @@ MSG[help_install]="Usage: bb install [--backend iptables|nft] [--iface IF] [--po
 Checks the platform, installs missing packages, backs up the current rules, creates the sets
 and rules in monitor mode, fills the allowlist (gateway, DNS, your SSH address), installs the
 systemd units and verifies the result. On a terminal it asks the questions; --yes does not."
-MSG[help_uninstall]="Usage: bb uninstall [--yes] [--purge]
+MSG[help_uninstall]="Usage: bb uninstall [--yes] [--keep-packages]
 
-Removes bb rules, sets and units. Other firewall rules are left alone and saved rule files
-are cleaned of bb entries. --purge also deletes the configuration and state."
+Removes everything bb installed or configured: units, rules and sets, configuration, state, backups,
+users, binaries and the packages bb itself added (a package is kept if removing it would also remove
+other software). Other firewall rules are left alone and saved rule files are cleaned of bb entries."
 
 MSG[err_notify_bad_value]="invalid %s"
 MSG[err_notify_chat_detect]="could not detect the chat ID (is jq installed, and did you write to the bot?)"

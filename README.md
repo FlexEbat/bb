@@ -2,30 +2,7 @@
 
 A lightweight, CLI-only tool that blocks BitTorrent, DHT and blocklisted IP ranges on a Linux host or gateway. Blocking happens in the kernel, so the CPU cost is close to zero. No web panel, no database, no heavy IDS.
 
-> **Status:** under development. See [`tech.md`](tech.md) for the full specification.
->
-> Implemented so far (development order, section 17 of the spec): **step 1 core**
-> (backend abstraction for iptables+ipset and nft, sets and rules, `ban`/`unban`/`allow`,
-> `mode` with confirmation rollback, `apply`, `guard`, locking, EN/RU catalogs with parity
-> and lint checks), **step 2 static lists**, **step 3 DHT nodes** and **step 4 installer**
-> (`bb install` with platform check, package plan for apt/dnf, backup, allowlist auto-fill,
-> systemd units with ordering and hardening, self-check; `bb uninstall [--purge]` that only
-> removes bb objects and cleans saved rule files; an unconfirmed `block` mode is reverted
-> after a reboot).
-> **Step 5 notifications** (`bb notify setup|test|status|enable|disable|events`): Telegram and
-> Matrix through `curl -K -` (secrets travel on stdin, never in the process list), Matrix JSON
-> built with `jq`, dedup and hourly limit, a bounded retry queue flushed by the guard timer,
-> best-effort background delivery that can never block a firewall command, `OnFailure=`
-> reporting, the notification endpoints kept in the allowlist, and a daily digest.
-> **Step 6 integrations and diagnostics** (`bb integrate auto|docker|k8s|ufw|firewalld|none|status`,
-> `bb doctor`): Docker networks (interfaces and `docker network inspect`), k3s (config, `config.yaml.d`,
-> defaults), kubeadm (controller-manager manifest), node addresses via `kubectl`, manual
-> `k8s_pod_cidr`/`k8s_service_cidr`; ufw and firewalld are only reported. Networks are refreshed by
-> `bb-guard` and loaded from the cache at boot (no Docker or kubectl needed). `bb doctor` checks the
-> backend, kernel support, rules and jump position, units, allowlist, `nftables.service`
-> `flush ruleset`, other firewall tools, SELinux/AVC, file permissions, queue and language catalogs.
-> Not yet: nDPId/listener (step 7), `--json`, `bb log`, distribution matrix (step 8).
-> Install the files with `make install`, then run `sudo bb install`.
+Status: under development
 
 ## Features
 
@@ -80,16 +57,15 @@ sudo bb notify test
 
 ```
 bb install [--lang en|ru] [--backend iptables|nft] [--iface IFACE] [--ports-mode only|all|except]
-           [--ports LIST] [--no-dpi] [--yes]
-bb status [--json]            bb doctor [--json]
-bb apply                      bb log -f
+           [--ports LIST] [--no-dpi] [--yes] [--force]
+bb status                     bb doctor
+bb apply                      bb guard
 bb lang [en|ru]               show or change the interface language
-bb list add|update|rm         bb show flows
-bb ban <ip|net> [--ttl 7d]    bb unban <ip|net>
-bb allow <ip|net>             bb integrate auto|docker|k8s|ufw|firewalld|status
-bb notify setup telegram|matrix | test | status | enable | disable
+bb list [add|update|rm]       bb ban <ip|net> [--ttl 7d]    bb unban <ip|net>
+bb allow <ip|net> [--rm]      bb integrate auto|docker|k8s|ufw|firewalld|none|status
+bb notify setup telegram|matrix | test | status | enable | disable | events
 bb mode monitor|block [--confirm SECONDS]
-bb uninstall
+bb uninstall [--yes] [--keep-packages]
 ```
 
 ## Notifications
@@ -111,7 +87,10 @@ Telegram needs a bot token and a chat ID. Matrix needs a homeserver URL, an acce
 sudo bb uninstall
 ```
 
-Removes only `bb`'s own chain/table, sets and units. It never flushes the whole ruleset.
+Removes everything `bb` installed or configured: its systemd units, its chain/table and sets, the
+configuration, state and backups, its users and binaries, and the packages `bb install` added
+(a package is kept if removing it would also remove other software; `--keep-packages` leaves all
+packages alone). Rules of other tools are never touched, and the whole ruleset is never flushed.
 
 ## Development
 
@@ -129,15 +108,6 @@ List sources may contain IPs, CIDRs, host names and tracker URLs
 Entries broader than /8 (IPv4) or /16 (IPv6) are rejected so that a bad list cannot
 block everything.
 
-## Deviations from tech.md
+## License
 
-- **Integration networks use a separate `internal` set.** The spec says container and pod networks
-  are added to `allow`, and that `allow` passes a packet when its source *or* destination matches.
-  Taken literally, that would also exempt a container talking to a *blocked* address, which
-  contradicts the acceptance criterion "traffic from containers and pods to blocked addresses is
-  dropped, while traffic between the containers and pods themselves passes". bb therefore puts
-  these networks into `internal4/6`, which exempts a packet only when **both** ends are internal.
-  Node addresses still go into the regular allowlist (either end). The tests assert the behaviour
-  with real traffic, and a mutation of the rule is caught.
-- `bb doctor`'s DHT-empty case during `bb install` is a warning, not a failure, so an install on a
-  host without working DNS still completes.
+`bb` is released under the MIT License. Copyright (c) 2026 FlexEbat. See [LICENSE](LICENSE).

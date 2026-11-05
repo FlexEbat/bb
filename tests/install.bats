@@ -187,7 +187,7 @@ STUB
 	grep -q "^lang='ru'" "$BB_CONF_DIR/bb.conf"
 }
 
-@test "uninstall removes only bb objects and cleans saved rule files" {
+@test "uninstall removes everything of bb, only bb objects of the firewall, and cleans saved rule files" {
 	mkdir -p "$R/saved"
 	cat >"$R/saved/rules.v4" <<'SAVE'
 *raw
@@ -214,7 +214,7 @@ SAVE
 	ipset create foreign_set hash:ip
 	run bb uninstall --yes
 	[ "$status" -eq 0 ]
-	[[ $output == *"Configuration kept"* ]]
+	[[ $output == *"bb has been removed completely."* ]]
 	run nft list tables; [[ $output != *"inet bb"* && $output == *foreign* ]]
 	run iptables -S INPUT; [[ $output == *8.8.4.4* ]]
 	run iptables -t raw -S; [[ $output != *BB_FILTER* ]]
@@ -225,20 +225,135 @@ SAVE
 	[ "$(stat -c %a "$R/saved/rules.v4")" = 640 ]
 	for u in bb-sets.service bb-firewall.service bb-update.timer bb-guard.timer; do [ ! -e "$BB_UNIT_DIR/$u" ]; done
 	grep -q 'disable bb-guard.timer' "$R/sd.log"
-	[ -s "$BB_CONF_DIR/bb.conf" ]              # configuration is kept
+	[ ! -e "$BB_CONF_DIR" ] && [ ! -e "$BB_STATE_DIR" ] && [ ! -e "$BB_BACKUP_DIR" ]   # nothing of bb's own is left
+	[ ! -e "$BB_SHARE_DIR" ] && [ ! -e "$BB_BIN_PATH" ]
 }
 
-@test "uninstall --purge removes configuration and state; needs --yes without a terminal" {
+@test "uninstall needs --yes without a terminal, then removes configuration, state and the lock" {
 	bb install --backend nft --yes --iface lo
 	run bb uninstall </dev/null
 	[ "$status" -ne 0 ]
 	has_bb_objects
-	run bb uninstall --yes --purge
+	[ -e "$BB_CONF_DIR/bb.conf" ]
+	run bb uninstall --yes
 	[ "$status" -eq 0 ]
-	[ ! -e "$BB_CONF_DIR" ] && [ ! -e "$BB_STATE_DIR" ]
+	[ ! -e "$BB_CONF_DIR" ] && [ ! -e "$BB_STATE_DIR" ] && [ ! -e "$BB_LOCK_FILE" ]
 	refute has_bb_objects
-	run bb uninstall --yes                     # running it again is harmless
+}
+
+# ---- packages that bb itself installed ------------------------------------------------------------
+pkg_stubs() { # $1 = apt | dnf
+	: >"$R/pkgs.state"; : >"$R/pkgs.extra"; : >"$R/absent"
+	export BB_TEST_ABSENT_FILE=$R/absent
+	if [ "$1" = apt ]; then
+		cat >"$R/stubs/dpkg-query" <<STUB
+#!/bin/sh
+sort -u "$R/pkgs.state"
+STUB
+		cat >"$R/stubs/apt-get" <<STUB
+#!/bin/sh
+echo "apt-get \$*" >>"$R/pkg.log"
+sim=0; [ "\$1" = -s ] && { sim=1; shift; }
+cmd=\$1; shift
+case "\$cmd" in
+	install) for a in "\$@"; do case "\$a" in -*) ;; *) echo "\$a" >>"$R/pkgs.state"; echo "\$a-deps" >>"$R/pkgs.state" ;; esac; done; : >"$R/absent" ;;
+	purge)
+		if [ \$sim = 1 ]; then
+			for a in "\$@"; do case "\$a" in -*) ;; *) grep -qx "\$a" "$R/pkgs.state" && echo "Remv \$a [1.0]" ;; esac; done
+			sed 's/^/Remv /' "$R/pkgs.extra"
+		else
+			for a in "\$@"; do case "\$a" in -*) ;; *) sed -i "/^\$a\$/d" "$R/pkgs.state" ;; esac; done
+		fi ;;
+esac
+STUB
+		printf 'ID=debian\n' >"$BB_OS_RELEASE"
+	else
+		cat >"$R/stubs/rpm" <<STUB
+#!/bin/sh
+case "\$1" in
+	-qa) sort -u "$R/pkgs.state" ;;
+	-q) cat "$R/pkgs.extra" ;;
+esac
+STUB
+		cat >"$R/stubs/dnf" <<STUB
+#!/bin/sh
+echo "dnf \$*" >>"$R/pkg.log"
+cmd=\$1; shift
+case "\$cmd" in
+	install) for a in "\$@"; do case "\$a" in -*) ;; *) echo "\$a" >>"$R/pkgs.state"; echo "\$a-deps" >>"$R/pkgs.state" ;; esac; done; : >"$R/absent" ;;
+	remove) for a in "\$@"; do case "\$a" in -*) ;; *) sed -i "/^\$a\$/d" "$R/pkgs.state" ;; esac; done ;;
+esac
+STUB
+		printf 'ID=rocky\nID_LIKE="rhel centos fedora"\n' >"$BB_OS_RELEASE"
+	fi
+	chmod +x "$R/stubs/"*
+	echo libpreexisting >>"$R/pkgs.state"
+}
+
+@test "uninstall (apt) removes the packages bb installed, dependencies included, and nothing else" {
+	pkg_stubs apt; printf 'nft\n' >"$R/absent"
+	bb install --backend nft --yes --iface lo >/dev/null
+	grep -qx 'pkg apt:nftables' "$BB_STATE_DIR/manifest"
+	grep -qx 'pkg apt:nftables-deps' "$BB_STATE_DIR/manifest"          # a dependency pulled in by the install
+	refute grep -q 'libpreexisting' "$BB_STATE_DIR/manifest"          # what was there before is not ours
+	run bb uninstall --yes
 	[ "$status" -eq 0 ]
+	[[ $output == *"Removed the packages bb had installed: "* ]]
+	grep -q 'apt-get purge -y -- ' "$R/pkg.log"
+	[ "$(cat "$R/pkgs.state")" = libpreexisting ]
+}
+
+@test "uninstall keeps a package other software depends on, and says so" {
+	pkg_stubs apt; printf 'nft\n' >"$R/absent"
+	bb install --backend nft --yes --iface lo >/dev/null
+	printf 'firewalld\n' >"$R/pkgs.extra"                              # purging would also remove firewalld
+	run bb uninstall --yes
+	[ "$status" -eq 0 ]
+	[[ $output == *"Kept the packages bb had installed"*"firewalld"* ]]
+	refute grep -q 'apt-get purge -y' "$R/pkg.log"
+	grep -qx nftables "$R/pkgs.state"
+	[ ! -e "$BB_CONF_DIR" ]                                           # everything else is gone regardless
+}
+
+@test "uninstall --keep-packages leaves packages alone" {
+	pkg_stubs apt; printf 'nft\n' >"$R/absent"
+	bb install --backend nft --yes --iface lo >/dev/null
+	run bb uninstall --yes --keep-packages
+	[ "$status" -eq 0 ]
+	refute grep -q 'apt-get' <(grep -v 'install' "$R/pkg.log")
+	grep -qx nftables "$R/pkgs.state"
+}
+
+@test "uninstall (dnf) removes what bb installed unless something requires it" {
+	pkg_stubs dnf; printf 'nft\n' >"$R/absent"
+	bb install --backend nft --yes --iface lo >/dev/null
+	grep -qx 'pkg dnf:nftables' "$BB_STATE_DIR/manifest"
+	run bb uninstall --yes
+	[[ $output == *"Removed the packages bb had installed"* ]]
+	grep -q 'dnf remove -y -- ' "$R/pkg.log"
+	[ "$(cat "$R/pkgs.state")" = libpreexisting ]
+}
+
+@test "uninstall (dnf) keeps packages that other installed software requires" {
+	pkg_stubs dnf; printf 'nft\n' >"$R/absent"
+	bb install --backend nft --yes --iface lo >/dev/null
+	printf 'firewalld\n' >"$R/pkgs.extra"
+	run bb uninstall --yes
+	[[ $output == *"Kept the packages bb had installed"* ]]
+	refute grep -q 'dnf remove' "$R/pkg.log"
+}
+
+@test "a failed package installation is still recorded so that uninstall can clean it up" {
+	pkg_stubs apt; printf 'nft\n' >"$R/absent"
+	cat >"$R/stubs/apt-get" <<STUB
+#!/bin/sh
+echo "apt-get \$*" >>"$R/pkg.log"
+[ "\$1" = install ] && { echo nftables >>"$R/pkgs.state"; exit 100; }
+exit 0
+STUB
+	run bb install --backend nft --yes --iface lo
+	[ "$status" -ne 0 ]
+	grep -qx 'pkg apt:nftables' "$BB_STATE_DIR/manifest"
 }
 
 @test "an unconfirmed block mode is reverted by apply/guard when the timer is gone" {
@@ -276,4 +391,21 @@ SAVE
 	run iptables -t raw -S; [[ $output != *BB_FILTER* ]]
 	bb apply
 	run bb status; [[ $output == *"Rules: active"* ]]
+}
+
+@test "backend: iptables without the nftables package is used as is, and jq is not installed in basic mode" {
+	pkg_stubs apt; printf 'nft\n' >"$R/absent"
+	run bb install --yes --iface lo
+	[ "$status" -eq 0 ]
+	grep -q "^backend='iptables'" "$BB_CONF_DIR/bb.conf"
+	[[ $output == *"Nothing to install."* ]]
+	refute grep -q 'install' "$R/pkg.log" 2>/dev/null
+	refute grep -qw jq "$R/pkg.log" 2>/dev/null
+}
+
+@test "install without working DNS still completes: the empty DHT set is only a warning" {
+	printf 'unresolvable.invalid:6881\n' >"$BB_CONF_DIR/dht.nodes" 2>/dev/null || { mkdir -p "$BB_CONF_DIR"; printf 'unresolvable.invalid:6881\n' >"$BB_CONF_DIR/dht.nodes"; }
+	run bb install --backend nft --yes --iface lo
+	[ "$status" -eq 0 ]
+	[[ $output == *"the DHT set is empty"* && $output == *"Self-check passed."* ]]
 }

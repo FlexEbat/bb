@@ -249,7 +249,7 @@ STUB
 	[ "$status" -eq 0 ]
 	[[ $output == *"Integrations: 1 internal networks"* ]]
 	nft list set inet bb internal4 | grep -qF 172.17.0.0/16
-	bb uninstall --yes --purge >/dev/null
+	bb uninstall --yes >/dev/null
 	run nft list tables; [[ $output != *"inet bb"* ]]
 	[ ! -e "$BB_STATE_DIR" ]
 }

@@ -25,7 +25,9 @@ if [[ ${BB_TESTING:-} == 1 ]]; then
 	SHARE_DIR=${BB_SHARE_DIR:?}
 	BACKUP_DIR=${BB_BACKUP_DIR:?}
 	LOCK_FILE=${BB_LOCK_FILE:?}
-	BIN_PATH=${BB_BIN_PATH:-/usr/local/sbin/bb}
+	BIN_PATH=${BB_BIN_PATH:-/nonexistent/bb}
+	NDPID_BIN=${BB_NDPID_BIN:-/nonexistent/bb-ndpid}
+	RUN_DIR=${BB_RUN_DIR:-/nonexistent/run}
 	UNIT_DIR=${BB_UNIT_DIR:?}
 	OS_RELEASE=${BB_OS_RELEASE:-/etc/os-release}
 	SAVED_RULE_FILES=${BB_SAVED_FILES:-}
@@ -42,6 +44,8 @@ else
 	BACKUP_DIR=/var/backups/bb
 	LOCK_FILE=/run/bb.lock
 	BIN_PATH=/usr/local/sbin/bb
+	NDPID_BIN=/usr/local/bin/bb-ndpid
+	RUN_DIR=/run/bb
 	UNIT_DIR=/etc/systemd/system
 	OS_RELEASE=/etc/os-release
 	SAVED_RULE_FILES="/etc/iptables/rules.v4 /etc/iptables/rules.v6 /etc/sysconfig/iptables /etc/sysconfig/ip6tables /etc/sysconfig/ipset /etc/iptables/ipsets"
@@ -53,6 +57,7 @@ else
 	NFTABLES_CONF=/etc/nftables.conf
 fi
 PENDING_FILE=$STATE_DIR/mode.pending
+MANIFEST=$STATE_DIR/manifest
 NOTIFY_CONF=$CONF_DIR/notify.conf
 NOTIFY_QUEUE=$STATE_DIR/notify.queue
 NOTIFY_DEDUP=$STATE_DIR/notify.dedup
@@ -74,7 +79,7 @@ DHT_CACHE=$STATE_DIR/dht.list
 AWK_NET=$SHARE_DIR/net.awk
 SELF=$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")
 
-# Entries broader than this are never accepted (a /0 would block everything).
+# D-005: entries broader than this are never accepted (a /0 would block everything).
 MIN_PREFIX4=8
 MIN_PREFIX6=16
 
@@ -489,7 +494,7 @@ ipt_rules() { # fam -> iptables-restore input (one atomic transaction)
 	for d in src dst; do
 		printf -- '-A BB_FILTER -m set --match-set bb_allow%s %s -j RETURN\n' "$f" "$d"
 	done
-	# integration networks (containers, pods): exempt only when BOTH ends are internal
+	# D-001: integration networks (containers, pods) are exempt only when BOTH ends are internal
 	printf -- '-A BB_FILTER -m set --match-set bb_internal%s src -m set --match-set bb_internal%s dst -j RETURN\n' "$f" "$f"
 	for d in src dst; do ipt_emit manual "-m set --match-set bb_manual$f $d"; done
 	for d in src dst; do ipt_emit list "-m set --match-set bb_list$f $d"; done
@@ -1097,7 +1102,9 @@ take_lock() {
 	have flock || die err_tools_missing flock
 	mkdir -p -- "$(dirname -- "$LOCK_FILE")"
 	exec 9>"$LOCK_FILE" || die err_write "$LOCK_FILE"
-	flock -w 30 9 || die err_lock
+	local wait=30
+	[[ ${BB_TESTING:-} == 1 ]] && wait=${BB_LOCK_WAIT:-30}
+	flock -w "$wait" 9 || die err_lock
 }
 
 # Load configuration; $1=require -> must be configured (a backend chosen).
@@ -1113,7 +1120,7 @@ load_config() {
 
 fw_live() { [[ -n $FW ]] && fw_check >/dev/null 2>&1; }
 
-# A block mode that was never confirmed must not survive a reboot (the rollback
+# D-006: a block mode that was never confirmed must not survive a reboot (the rollback
 # timer is transient). Called before apply/guard.
 mode_check_pending() {
 	[[ -e $PENDING_FILE ]] || return 0
@@ -1530,6 +1537,7 @@ ncfg_save() { # secrets only; root, 0600, atomic
 	} | write_atomic "$NOTIFY_CONF"
 }
 
+# D-003: only the secrets live in notify.conf; the other notify_* settings are in bb.conf
 notify_channels() { # prints configured channels, one per line
 	[[ -n ${NCFG[telegram_token]} && -n ${NCFG[telegram_chat]} ]] && printf 'telegram\n'
 	[[ -n ${NCFG[matrix_url]} && -n ${NCFG[matrix_token]} && -n ${NCFG[matrix_room]} ]] && have jq && printf 'matrix\n'
@@ -2149,6 +2157,7 @@ integ_status_lines() { # prints the status table
 	say integ_row firewalld "$(t "st_$st")" "$(t integ_d_fwd "$(t "st_$st")" "$(firewalld_backend)")"
 }
 
+# D-004: bb integrate none|<name> are additions to the specified CLI
 cmd_integrate() {
 	local sub=${1:-status} cur
 	[[ $# -gt 0 ]] && shift
@@ -2376,6 +2385,28 @@ plan_install() { # [forced backend]
 	have ip || pkgs+=" iproute2"
 	PLAN_PKGS=$(printf '%s\n' $pkgs | awk 'NF && !seen[$0]++' | tr '\n' ' ')
 	PLAN_PKGS=${PLAN_PKGS% }
+}
+
+# What bb itself added to the system is recorded, so that "bb uninstall" can take back
+# exactly that and nothing else. Lines: "<kind> <value>" with kind pkg|user.
+manifest_add() { # kind value
+	[[ $2 =~ ^[A-Za-z0-9_.:+-]+$ ]] || return 1
+	mkdir -p -- "$STATE_DIR"
+	grep -qxF -- "$1 $2" "$MANIFEST" 2>/dev/null || printf '%s %s\n' "$1" "$2" >>"$MANIFEST"
+}
+
+pkgs_snapshot() { # installed package names, sorted
+	case $OS_FAMILY in
+		apt) dpkg-query -W -f='${Package}\n' 2>/dev/null ;;
+		dnf) rpm -qa --qf '%{NAME}\n' 2>/dev/null ;;
+	esac | sort -u
+}
+
+# Records the packages that appeared between two snapshots (dependencies included).
+pkgs_record_new() { # before-snapshot
+	local p
+	while IFS= read -r p; do manifest_add pkg "$OS_FAMILY:$p"; done < <(comm -13 <(printf '%s\n' "$1") <(pkgs_snapshot))
+	return 0
 }
 
 pkg_install() { # family logical...
@@ -2681,7 +2712,10 @@ cmd_install() {
 		[[ $OS_FAMILY != unknown ]] || die err_os_unsupported "${OS_ID:-?}" "$PLAN_PKGS"
 		say inst_pkg_installing "$PLAN_PKGS"
 		# shellcheck disable=SC2086
-		pkg_install "$OS_FAMILY" $PLAN_PKGS || die err_pkg_install
+		local before
+		before=$(pkgs_snapshot)
+		if ! pkg_install "$OS_FAMILY" $PLAN_PKGS; then pkgs_record_new "$before"; die err_pkg_install; fi
+		pkgs_record_new "$before"
 		missing=$(backend_missing "$PLAN_BACKEND" | tr '\n' ' ')
 		[[ -z ${missing// /} ]] || die err_pkg_still_missing "$missing"
 	else
@@ -2752,7 +2786,7 @@ cmd_install() {
 		say inst_backup_kept "$bdir"
 		exit 1
 	fi
-	[[ -s $DHT_CACHE ]] || warn warn_check_dht_empty
+	[[ -s $DHT_CACHE ]] || warn warn_check_dht_empty # D-002: an empty DHT set is a warning, not a failure
 	rm -rf -- "$BACKUP_DIR"/install-*
 	log_event "install backend=$PLAN_BACKEND mode=monitor"
 	say inst_check_ok
@@ -2779,12 +2813,45 @@ strip_saved_file() {
 
 safe_rm_dir() { [[ -n $1 && $1 != / && $1 == /?* ]] && rm -rf -- "$1"; }
 
+# Removes the packages that bb installed, but only those nobody else needs: if taking them
+# out would also remove other packages, they are kept and reported.
+uninstall_packages() { # names (without the family prefix)
+	local -a pk=("$@") extra=()
+	local p dep
+	((${#pk[@]})) || return 0
+	case $OS_FAMILY in
+		apt)
+			have apt-get || return 0
+			while IFS= read -r p; do
+				[[ " ${pk[*]} " == *" $p "* ]] || extra+=("$p")
+			done < <(apt-get -s purge -- "${pk[@]}" 2>/dev/null | awk '$1 == "Remv" { print $2 }')
+			if ((${#extra[@]})); then say uninst_pkg_kept "${pk[*]}" "${extra[*]}"; return 0; fi
+			DEBIAN_FRONTEND=noninteractive apt-get purge -y -- "${pk[@]}" >/dev/null 2>&1 || warn warn_pkg_remove "${pk[*]}"
+			;;
+		dnf)
+			have rpm || return 0
+			for p in "${pk[@]}"; do
+				while IFS= read -r dep; do
+					[[ -n $dep && $dep != "no package requires"* && " ${pk[*]} " != *" ${dep%%-[0-9]*} "* ]] && extra+=("$dep")
+				done < <(rpm -q --whatrequires "$p" --qf '%{NAME}\n' 2>/dev/null)
+			done
+			if ((${#extra[@]})); then say uninst_pkg_kept "${pk[*]}" "${extra[*]}"; return 0; fi
+			dnf remove -y -- "${pk[@]}" >/dev/null 2>&1 || warn warn_pkg_remove "${pk[*]}"
+			;;
+	esac
+	say uninst_pkg_removed "${pk[*]}"
+}
+
+# bb uninstall: takes back everything bb installed or configured (units, firewall objects,
+# configuration, state, backups, users, binaries and the packages it added), and leaves every
+# other firewall rule as it was.
 cmd_uninstall() {
-	local yes=0 purge=0 u ans=""
+	local yes=0 keep_pkgs=0 u ans="" line kind val
+	local -a pkgs=() users=()
 	while (($#)); do
 		case $1 in
 			--yes | -y) yes=1; shift ;;
-			--purge) purge=1; shift ;;
+			--keep-packages) keep_pkgs=1; shift ;;
 			*) die err_unknown_opt "$1" ;;
 		esac
 	done
@@ -2795,26 +2862,38 @@ cmd_uninstall() {
 		read -r ans
 		[[ ${ans,,} == y || ${ans,,} == yes ]] || { say uninst_aborted; exit 1; }
 	fi
-	NOTIFY_SYNC=1 log_event "uninstall purge=$purge"
-	for u in bb-mode-rollback.timer bb-guard.timer bb-update.timer bb-digest.timer bb-digest.service bb-firewall.service bb-sets.service bb-guard.service bb-update.service; do
+	os_info
+	if [[ -r $MANIFEST ]]; then
+		while read -r kind val; do
+			case $kind in
+				pkg) [[ $val == "$OS_FAMILY:"* ]] && pkgs+=("${val#*:}") ;;
+				user) users+=("$val") ;;
+			esac
+		done <"$MANIFEST"
+	fi
+	NOTIFY_SYNC=1 log_event "uninstall"
+	for u in $UNIT_NAMES bb-mode-rollback.timer; do
 		systemctl stop "$u" >/dev/null 2>&1
 		systemctl disable "$u" >/dev/null 2>&1
 	done
 	for u in $UNIT_NAMES; do rm -f -- "$UNIT_DIR/$u" "$UNIT_DIR/$u.new"; done
 	systemctl daemon-reload >/dev/null 2>&1
+	systemctl reset-failed >/dev/null 2>&1
 	# Only bb objects go; everything else in the firewall stays as it was.
 	have iptables && ipt_remove
 	have nft && nft_remove
 	for u in $SAVED_RULE_FILES; do strip_saved_file "$u"; done
-	rm -f -- "$PENDING_FILE"
-	if ((purge)); then
-		safe_rm_dir "$CONF_DIR"; safe_rm_dir "$STATE_DIR"; safe_rm_dir "$BACKUP_DIR"
-		TMPD=""
-		if [[ ${BB_TESTING:-} != 1 ]]; then safe_rm_dir "$SHARE_DIR"; rm -f -- "$BIN_PATH"; fi
-		say uninst_purged
-	else
-		say uninst_done "$CONF_DIR"
-	fi
+	for u in "${users[@]+"${users[@]}"}"; do
+		getent passwd "$u" >/dev/null 2>&1 && userdel "$u" >/dev/null 2>&1
+		getent group "$u" >/dev/null 2>&1 && groupdel "$u" >/dev/null 2>&1
+	done
+	if ((keep_pkgs == 0)); then uninstall_packages "${pkgs[@]+"${pkgs[@]}"}"; fi
+	TMPD=""
+	rm -f -- "$NDPID_BIN" "$LOCK_FILE"
+	safe_rm_dir "$RUN_DIR"; safe_rm_dir "$CONF_DIR"; safe_rm_dir "$STATE_DIR"; safe_rm_dir "$BACKUP_DIR"
+	safe_rm_dir "$SHARE_DIR"
+	rm -f -- "$BIN_PATH"
+	say uninst_done
 }
 
 cmd___sets_restore() { # boot-time: sets only, before any other firewall service

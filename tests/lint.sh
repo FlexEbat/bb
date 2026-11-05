@@ -30,4 +30,9 @@ for k in status_rules_present status_rules_absent; do [[ -v EN[$k] ]] || { echo 
 if grep -nE '\b(say|warn|err|die)[[:space:]]+"[^"$]*[ A-Z]' src/bb | grep -v 'bb-lint: ok'; then
 	echo "lint: hard-coded user-visible string (use the catalog)"; fail=1
 fi
+# no interpreters: the product is bash plus standard tools (no Python, Perl, Ruby, Node)
+if grep -nE '^[^#]*\b(python3?|perl|ruby|node)\b[[:space:]]+[-A-Za-z./]' src/bb src/net.awk 2>/dev/null | grep -v 'bb-lint: ok'; then
+	echo "lint: no interpreters are allowed in the product"; fail=1
+fi
+[[ $(head -1 src/bb) == '#!/usr/bin/env bash' ]] || { echo "lint: src/bb must be a bash script"; fail=1; }
 exit $fail

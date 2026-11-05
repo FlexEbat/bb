@@ -247,3 +247,18 @@ LIST
 	run cat "$BB_STATE_DIR/lists/t.list"
 	[ "$output" = "198.51.100.55" ]
 }
+
+@test "locking: a second state-changing command waits for the lock, and fails with a message when it cannot get it" {
+	bb __init-config --backend nft
+	( flock 9; sleep 2 ) 9>"$BB_LOCK_FILE" &
+	sleep 0.3
+	BB_LOCK_WAIT=10 run bb ban 198.51.100.9           # waits, then succeeds
+	[ "$status" -eq 0 ]
+	( flock 9; sleep 3 ) 9>"$BB_LOCK_FILE" &
+	sleep 0.3
+	BB_LOCK_WAIT=1 run bb ban 198.51.100.10           # gives up
+	[ "$status" -ne 0 ]
+	[[ $output == *"another bb command is running"* ]]
+	wait
+	refute grep -q '198.51.100.10' "$BB_CONF_DIR/manual.list"
+}
