@@ -1383,10 +1383,61 @@ cmd_lang() {
 	say lang_set "$want"
 }
 
+json_need() { # --json is built with jq: without it print a hint and stop
+	have jq || die err_json_jq
+}
+
+# Parses the arguments of a command that takes only --json; sets JSON=1 for it.
+json_args() { # cmd args...
+	local cmd=$1 a
+	shift
+	JSON=0
+	for a in "$@"; do
+		case $a in
+			--json) JSON=1 ;;
+			*) die err_usage "$cmd" ;;
+		esac
+	done
+	if ((JSON)); then json_need; fi
+	return 0
+}
+
+# Untranslated status document: stable keys, values straight from the configuration and the kernel.
+status_json() { # state(present|absent) variant sets counters
+	jq -n --arg version "$BB_VERSION" --arg backend "${CFG[backend]}" --arg variant "$2" \
+		--arg mode "${CFG[mode]}" --arg lang "${CFG[lang]}" --arg state "$1" \
+		--arg sets "$3" --arg counters "$4" '
+		def lines($s): $s | split("\n") | map(select(length > 0) | split(" "));
+		def num: try tonumber catch null;
+		{version: $version, backend: $backend,
+		 iptables_variant: (if $variant == "" then null else $variant end),
+		 mode: $mode, lang: $lang,
+		 rules: (if $state == "present" then "active" else "inactive" end),
+		 sets: [lines($sets)[] | select(length == 2) | {name: .[0], entries: (.[1] | num)}],
+		 counters: [lines($counters)[] | select(length == 3) | {category: .[0], packets: (.[1] | num), bytes: (.[2] | num)}]}'
+}
+
 cmd_status() {
+	json_args status "$@"
 	need_root; load_config require
 	local state="absent" l
 	fw_live && state=present
+	if ((JSON)); then
+		local variant="" sets="" counters="" kind a b c
+		[[ $FW == ipt ]] && variant=$(iptables_variant)
+		if [[ $state == present ]]; then
+			local out
+			out=$(fw_status)
+			while read -r kind a b c; do
+				case $kind in
+					set) sets+="$a $b"$'\n' ;;
+					counter) counters+="$a $b $c"$'\n' ;;
+				esac
+			done < <(sort <<<"$out")
+		fi
+		status_json "$state" "$variant" "$sets" "$counters"
+		return 0
+	fi
 	say status_title "$BB_VERSION"
 	if [[ $FW == ipt ]]; then say status_backend "iptables ($(iptables_variant))"; else say status_backend nft; fi
 	say status_mode "${CFG[mode]}"
@@ -2191,7 +2242,8 @@ cmd_integrate() {
 }
 
 # ---- bb doctor -----------------------------------------------------------------------------------
-DOC_FAIL=0 DOC_WARN=0
+DOC_FAIL=0 DOC_WARN=0 DOC_JSON=0
+DOC_ROWS=()
 doc() { # level(ok|warn|fail) key args...
 	local lvl=$1 lbl
 	shift
@@ -2200,8 +2252,18 @@ doc() { # level(ok|warn|fail) key args...
 		warn) lbl=$(t doc_lbl_warn); DOC_WARN=$((DOC_WARN + 1)) ;;
 		fail) lbl=$(t doc_lbl_fail); DOC_FAIL=$((DOC_FAIL + 1)) ;;
 	esac
+	if ((DOC_JSON)); then # stable id (the catalog key without "doc_") and the raw arguments, no text
+		local id=${1#doc_}
+		shift
+		DOC_ROWS+=("$(jq -nc --arg level "$lvl" --arg id "$id" '{level: $level, id: $id, args: $ARGS.positional}' --args -- "$@")")
+		return 0
+	fi
 	printf '[%s] ' "$lbl"
 	say "$@"
+}
+
+doc_word() { # st_* key: the translated word in text mode, the raw word in --json mode
+	if ((DOC_JSON)); then printf '%s' "${1#st_}"; else t "$1"; fi
 }
 
 doctor_backend() {
@@ -2276,7 +2338,7 @@ doctor_integrations() {
 	fi
 	st=$(ufw_state)
 	if [[ $st == active ]]; then
-		doc ok doc_int_ufw "$(t st_active)"
+		doc ok doc_int_ufw "$(doc_word st_active)"
 		[[ -s $ALLOW_FILE ]] || doc warn doc_ufw_admin
 	fi
 	st=$(firewalld_state)
@@ -2339,10 +2401,12 @@ doctor_dpi() {
 }
 
 cmd_doctor() {
+	json_args doctor "$@"
+	DOC_JSON=$JSON
 	need_root; cfg_load || true
 	[[ -n ${CFG[backend]} ]] && fw_select
-	DOC_FAIL=0 DOC_WARN=0
-	say doc_title
+	DOC_FAIL=0 DOC_WARN=0 DOC_ROWS=()
+	((DOC_JSON)) || say doc_title
 	doctor_backend
 	doctor_rules
 	doctor_units
@@ -2352,8 +2416,36 @@ cmd_doctor() {
 	doctor_dpi
 	doctor_selinux
 	doctor_files
-	say doc_summary "$DOC_FAIL" "$DOC_WARN"
+	if ((DOC_JSON)); then
+		printf '%s\n' "${DOC_ROWS[@]}" | jq -s --arg version "$BB_VERSION" --argjson fail "$DOC_FAIL" --argjson warn "$DOC_WARN" \
+			'{version: $version, ok: ($fail == 0), fail: $fail, warn: $warn, checks: .}'
+	else
+		say doc_summary "$DOC_FAIL" "$DOC_WARN"
+	fi
 	((DOC_FAIL == 0))
+}
+
+# ---- bb log ----------------------------------------------------------------------------------------
+# D-004: bb log without -f and -n N are additions to the specified CLI
+# One stream for the events bb writes to the journal (tag "bb") and the kernel messages its LOG rules
+# produce (prefix "bb: "). The journal is the only log; bb keeps no log file of its own (tech.md section 10).
+cmd_log() {
+	local follow=0 n=50
+	while (($#)); do
+		case $1 in
+			-f | --follow) follow=1 ;;
+			-n) shift; is_uint "${1:-}" && (($1 >= 1 && $1 <= 100000)) || die err_log_n; n=$1 ;;
+			*) die err_usage log ;;
+		esac
+		shift
+	done
+	have journalctl || die err_log_nojournal
+	local args=(-o short-iso --no-pager -n "$n")
+	((follow)) && args+=(-f)
+	# (tag bb) OR (kernel); the awk below keeps only kernel lines that start with the bb: prefix
+	journalctl "${args[@]}" -t bb + _TRANSPORT=kernel |
+		awk '$3 ~ /^bb(\[[0-9]+\])?:$/ || ($3 == "kernel:" && $4 == "bb:") { print; fflush() }'
+	return 0
 }
 
 # ---- dynamic layer: the listener and the flow sets (tech.md section 6.4) ------------------------------
@@ -3451,6 +3543,7 @@ main() {
 		__listener) cmd___listener "$@" ;;
 		__save-flows) cmd___save_flows "$@" ;;
 		doctor) cmd_doctor "$@" ;;
+		log) cmd_log "$@" ;;
 		__notify-flush) cmd___notify_flush "$@" ;;
 		__notify-event) cmd___notify_event "$@" ;;
 		__digest) cmd___digest "$@" ;;

@@ -284,7 +284,7 @@ bb notify test                   send a test message
 bb notify status                 channels, events, queue size
 bb notify enable|disable
 bb show flows                    what was blocked by DPI
-bb log -f                        event log
+bb log [-f] [-n N]               event log (journal tag bb and kernel messages "bb:")
 bb mode monitor|block [--confirm 60]
 bb uninstall [--yes] [--keep-packages]   remove everything bb installed or configured
 ```
@@ -298,6 +298,14 @@ General rules: commands that change the system require root; exit code 0 on succ
 **`bb uninstall`** removes everything `bb` installed or configured, and nothing else: its systemd units and timers, its firewall objects (the `BB_FILTER` chain and ipset sets, or the `inet bb` table), the configuration, state and backups (`/etc/bb`, `/var/lib/bb`, `/var/backups/bb`), the `bb` and `bb-ndpid` users, the binaries (`bb`, `bb-ndpid`), the language catalogs, the lock, and the packages that `bb install` added. Packages are tracked in `/var/lib/bb/manifest` as the difference between the installed packages before and after each installation (dependencies included, including the build packages for nDPId); a package is kept, and reported, if removing it would also remove other software. `--keep-packages` leaves all packages alone. Saved rule files that referenced `bb` objects are re-saved without them. On a terminal the command asks for confirmation; without one it needs `--yes`.
 
 **`bb doctor`** checks: the selected backend and the presence of the required utilities and kernel modules; the iptables variant (nf_tables or legacy); the presence of the `bb` chain or table and the jump position; the state of units and timers; a non-empty allowlist (gateway, DNS, SSH IP); whether `nftables.service` is enabled and whether its configuration contains `flush ruleset`; the status of Docker, k3s/k8s, ufw, firewalld; on dnf systems, SELinux and recent AVC denials for `bb`; the permissions of `/etc/bb/notify.conf` and the notification queue size; the language catalogs (both present, selected language available).
+
+### `--json` output
+
+`bb status --json` prints one document: `version`, `backend` (`iptables` or `nft`), `iptables_variant` (`nf_tables`, `legacy`, `unknown`, or `null` for `nft`), `mode`, `lang`, `rules` (`active` or `inactive`), `sets` (a list of `{name, entries}`, `entries` is a number or `null` when the set cannot be read) and `counters` (a list of `{category, packets, bytes}`). When the rules are not active `sets` and `counters` are empty.
+
+`bb doctor --json` prints one document: `version`, `ok`, `fail`, `warn` and `checks`, a list of `{level, id, args}` where `level` is `ok`, `warn` or `fail`, `id` is the catalog key of the check without its `doc_` prefix (for example `backend_ok`, `rules_fail`) and `args` are the raw values the text message would show. There is no message text, so the document is identical in both languages. The exit code is the same as without `--json`.
+
+Both documents are built with `jq`. Without `jq` the command prints how to install it and exits non-zero, before doing anything else.
 
 ### Interface language
 
@@ -481,7 +489,7 @@ The work is split into vertical slices, done in order. A slice is closed when ev
 | S5 | Notifications | partial | 11/12 |
 | S6 | Integrations and diagnostics | partial | 8/9 |
 | S7 | Dynamic layer (nDPId and the listener) | partial | 17/20 |
-| S8 | Machine-readable output and logs | remaining | 0/3 |
+| S8 | Machine-readable output and logs | partial | 2/3 |
 | S9 | Test matrix and CI | remaining | 0/7 |
 | S10 | Documentation and release | partial | 2/4 |
 
@@ -681,15 +689,15 @@ The work is split into vertical slices, done in order. A slice is closed when ev
 
 ### Slice 8: Machine-readable output and logs
 
-**Files:** `src/bb`, `tests/json.bats`.
+**Files:** `src/bb`, `lang/en.sh`, `lang/ru.sh`, `tests/json.bats`.
 
-**What it does:** `--json` for `bb status` and `bb doctor`, `bb log -f`.
+**What it does:** `--json` for `bb status` and `bb doctor`, `bb log [-f] [-n N]`.
 
 **Acceptance criteria:**
 
-1. [ ] **S8.1** `bb status --json` and `bb doctor --json` are valid JSON with stable keys and untranslated values.
-2. [ ] **S8.2** Without `jq` a hint is printed and the exit code is non-zero.
-3. [ ] **S8.3** `bb log -f` merges the journal tag `bb` and the kernel messages with the prefix `bb:`.
+1. [x] **S8.1** `bb status --json` and `bb doctor --json` are valid JSON with stable keys and untranslated values. (tests/json.bats: status --json is valid JSON with stable keys on both backends) (tests/json.bats: status --json reports inactive rules with empty sets) (tests/json.bats: status --json and doctor --json are the same in both languages) (tests/json.bats: doctor --json lists checks with level, stable id and raw arguments) (tests/json.bats: doctor --json keeps the exit code and the untranslated ufw state) (tests/json.bats: doctor --json works on an unconfigured host)
+2. [x] **S8.2** Without `jq` a hint is printed and the exit code is non-zero. (tests/json.bats: without jq a hint is printed and the exit code is non-zero, in both languages)
+3. [~] **S8.3** `bb log -f` merges the journal tag `bb` and the kernel messages with the prefix `bb:`. The query (`-t bb + _TRANSPORT=kernel`, then a filter on the kernel prefix) is tested against a `journalctl` stand-in only; the behaviour on a real journal is covered by slice 9. (tests/json.bats: bb log merges the journal tag bb and kernel messages with the prefix bb:) (tests/json.bats: bb log -f follows and -n sets the number of lines)
 
 **Tests:** `tests/json.bats`.
 
@@ -754,7 +762,7 @@ A deviation is a place where the implementation deliberately does something othe
 | D-001 | §6.1, §8 | Container and pod networks (Docker, k3s/k8s) go to separate `internal4/6` sets that exempt a packet only when both its source and its destination are internal. The text adds them to `allow`, which passes a packet when either end matches. Node addresses stay in `allow`. | Taken literally the text would exempt a container that talks to a blocked address, which contradicts the acceptance criterion that traffic from containers and pods to blocked addresses is dropped while traffic between them passes. | active | (tests/integrations.bats: containers/pods talk to each other, but not to blocked addresses) |
 | D-002 | §11 | An empty DHT set at the end of `bb install` is a warning in the self-check, not a failure. | An install on a host without working DNS must still complete; `bb list update dht` fills the set later. | active | (tests/install.bats: install without working DNS still completes) |
 | D-003 | §9, §12 | Only the notification secrets (tokens, chat, homeserver, room) are stored in `notify.conf`; the other `notify_*` settings live in `bb.conf`. | The text puts "tokens and settings" in `notify.conf` and also lists `notify_*` among the `bb.conf` parameters. Splitting keeps the secrets file minimal and everything else readable. | active | (tests/notify.bats: telegram setup: verified with a test message, secrets only in notify.conf) |
-| D-004 | §10 | Additions to the CLI: `bb allow <net> --rm`, `bb list` without arguments (shows the lists), `bb notify events [LIST]`, `bb integrate none` and `bb integrate <name>`, `bb uninstall --keep-packages`, and internal commands starting with `__` that units and tests call. | Without them the allowlist could not shrink, the lists could not be inspected, and the units had nothing to call. | active | (tests/cli.bats: ban/unban/allow edit the source files; ban is idempotent) (tests/integrations.bats: bb integrate: selection, none, auto, errors and status) (tests/install.bats: uninstall --keep-packages leaves packages alone) |
+| D-004 | §10 | Additions to the CLI: `bb allow <net> --rm`, `bb log` without `-f` and `bb log -n N`, `bb list` without arguments (shows the lists), `bb notify events [LIST]`, `bb integrate none` and `bb integrate <name>`, `bb uninstall --keep-packages`, and internal commands starting with `__` that units and tests call. | Without them the allowlist could not shrink, the lists could not be inspected, the log could not be read without following it, and the units had nothing to call. | active | (tests/cli.bats: ban/unban/allow edit the source files; ban is idempotent) (tests/json.bats: bb log -f follows and -n sets the number of lines) (tests/integrations.bats: bb integrate: selection, none, auto, errors and status) (tests/install.bats: uninstall --keep-packages leaves packages alone) |
 | D-005 | §6.1, §7 | Entries broader than /8 (IPv4) or /16 (IPv6) are rejected in lists and in manual bans and allowlist entries. | One bad line such as `0.0.0.0/0` must not be able to block everything. | active | (tests/cli.bats: norm: invalid and too-broad entries are rejected) |
 | D-006 | §10, §13 | An unconfirmed `block` mode is also reverted after a reboot: a marker is kept while the rollback timer runs, and `apply` and `guard` revert the mode when the timer is gone. | The rollback timer is transient and does not survive a reboot, so a host rebooted inside the confirmation window would stay in an unconfirmed `block`. | active | (tests/install.bats: an unconfirmed block mode is reverted by apply/guard when the timer is gone) |
 | D-007 | §11 | nDPId is cloned with `git clone --depth 1 --branch <ref>` (a full clone and a checkout when the reference is a commit) and only the `libnDPI` submodule is initialised, instead of `git clone --recursive`. | The other submodules are examples that are never built (`BUILD_EXAMPLES=OFF`) and are hosted on a second server, which makes the build fail on restricted networks. | active | (tests/dpi_install.bats: the build clones the pinned tag and initialises only libnDPI) |

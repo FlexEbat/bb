@@ -98,6 +98,7 @@ Usage: bb COMMAND [options]       (add --help to any command)
   notify setup|test|status    Telegram / Matrix notifications
   integrate [auto|docker|...] Docker, k3s/k8s, ufw, firewalld   doctor   diagnostics
   show flows                  flows added by traffic inspection
+  log [-f]                    bb events and kernel messages from the journal
   lang [en|ru]                show or change the interface language
 
 Global option: --lang en|ru"
@@ -107,9 +108,10 @@ Rebuilds all sets and rules from the configuration. Safe to run at any time."
 MSG[help_guard]="Usage: bb guard
 
 Restores the rules if they disappeared or lost their first position. Used by the guard timer."
-MSG[help_status]="Usage: bb status
+MSG[help_status]="Usage: bb status [--json]
 
-Shows the backend, the mode, the size of every set and the drop counters."
+Shows the backend, the mode, the size of every set and the drop counters. --json prints the same
+as one JSON document with stable keys and untranslated values (needs jq)."
 MSG[help_mode]="Usage: bb mode [monitor|block|confirm] [--confirm [SECONDS]]
 
 monitor logs and counts without dropping; block drops. With --confirm the mode
@@ -187,6 +189,13 @@ other software). Other firewall rules are left alone and saved rule files are cl
 MSG[err_notify_bad_value]="invalid %s"
 MSG[err_notify_chat_detect]="could not detect the chat ID (is jq installed, and did you write to the bot?)"
 MSG[err_notify_event]="unknown event '%s'"
+MSG[err_json_jq]="--json needs jq; install it with your package manager (apt install jq, dnf install jq)"
+MSG[err_log_n]="-n needs a number from 1 to 100000"
+MSG[err_log_nojournal]="journalctl is not available: bb writes its events to the systemd journal"
+MSG[help_log]="Usage: bb log [-f] [-n LINES]
+
+Shows the events bb wrote to the journal (tag bb) together with the kernel messages of its LOG
+rules (prefix bb:), newest last. -f keeps following. The journal is the only log."
 MSG[err_notify_jq]="jq is required for %s (install it with your package manager)"
 MSG[err_notify_none]="no notification channel is configured; run 'bb notify setup telegram|matrix'"
 MSG[err_notify_test_failed]="delivery to %s failed (curl exit %s); nothing was saved"
@@ -306,7 +315,8 @@ MSG[help_doctor]="Usage: bb doctor
 
 Checks the backend, kernel support, rules and their position, units, the allowlist, known
 conflicts (nftables.service, Docker, k8s, ufw, firewalld, fail2ban, ...), SELinux, file
-permissions, the notification queue and the language catalogs. Exit code 1 on any FAIL."
+permissions, the notification queue and the language catalogs. Exit code 1 on any FAIL. --json prints one JSON document
+(checks with a stable id, a level and raw arguments, no text; needs jq)."
 
 MSG[err_dpi_build]="building nDPId failed; the firewall was not changed. Log: %s (use --no-dpi to continue without traffic inspection)"
 MSG[err_dpi_flag]="could not find the capture-filter option in the help of nDPId; use --ports-mode all or --no-dpi"
