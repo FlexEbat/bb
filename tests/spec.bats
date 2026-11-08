@@ -126,3 +126,41 @@ check() { "$R/repo/tests/check-spec.sh"; }
 	echo "$output"
 	[ "$status" -eq 0 ]
 }
+
+@test "CHANGELOG.md follows Keep a Changelog" {
+	run bash "$REPO/tests/check-release.sh"
+	echo "$output"; [ "$status" -eq 0 ]
+	cp "$REPO/CHANGELOG.md" "$R/cl.md"
+	sed -i 's/^## \[Unreleased\]/## Unreleased/' "$R/cl.md"
+	BB_CHANGELOG=$R/cl.md run bash "$REPO/tests/check-release.sh"
+	[ "$status" -ne 0 ]; [[ $output == *"Unreleased"* ]]
+	cp "$REPO/CHANGELOG.md" "$R/cl.md"
+	printf '\n## [0.0.1] - 2026-01-01\n\n### Tweaked\n\n- x\n' >>"$R/cl.md"
+	BB_CHANGELOG=$R/cl.md run bash "$REPO/tests/check-release.sh"
+	[ "$status" -ne 0 ]; [[ $output == *"unknown kind of change"* ]]
+	printf '## [Unreleased]\n' >"$R/cl.md"
+	BB_CHANGELOG=$R/cl.md run bash "$REPO/tests/check-release.sh"
+	[ "$status" -ne 0 ]
+}
+
+@test "release check: the tag, BB_VERSION and the CHANGELOG must agree, and make dist builds checksums" {
+	cp "$REPO/CHANGELOG.md" "$R/cl.md"; cp "$REPO/src/bb" "$R/bb.src"
+	sed -i 's/^BB_VERSION=.*/BB_VERSION="1.2.3"/' "$R/bb.src"
+	export BB_CHANGELOG=$R/cl.md BB_SOURCE=$R/bb.src
+	run bash "$REPO/tests/check-release.sh" v1.2.3                 # no dated section yet
+	[ "$status" -ne 0 ]; [[ $output == *"no dated section"* ]]
+	sed -i 's/^## \[Unreleased\]/&\n\n## [1.2.3] - 2026-12-01/' "$R/cl.md"
+	run bash "$REPO/tests/check-release.sh" v1.2.3; [ "$status" -eq 0 ]
+	run bash "$REPO/tests/check-release.sh" v1.2.4; [ "$status" -ne 0 ]; [[ $output == *"does not match"* ]]
+	run bash "$REPO/tests/check-release.sh" 1.2.3; [ "$status" -ne 0 ]
+	unset BB_CHANGELOG BB_SOURCE
+	# the real tree is a development version, so a tag for it is refused
+	run bash "$REPO/tests/check-release.sh" v0.1.0; [ "$status" -ne 0 ]
+	# archive and checksums (built from a copy, with the version of the copy)
+	mkdir "$R/tree"; cp -r "$REPO"/src "$REPO"/lang "$REPO"/tests "$REPO"/LICENSE "$REPO"/README.md "$REPO"/Makefile "$R/tree/"
+	cp "$R/cl.md" "$R/tree/CHANGELOG.md"; cp "$R/bb.src" "$R/tree/src/bb"
+	cd "$R/tree"
+	run make dist TAG=v1.2.3; echo "$output"; [ "$status" -eq 0 ]
+	(cd dist && sha256sum -c SHA256SUMS)
+	tar -tzf dist/bb-1.2.3.tar.gz | grep -q 'bb-1.2.3/src/bb'
+}

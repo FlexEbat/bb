@@ -490,8 +490,8 @@ The work is split into vertical slices, done in order. A slice is closed when ev
 | S6 | Integrations and diagnostics | partial | 8/9 |
 | S7 | Dynamic layer (nDPId and the listener) | partial | 17/20 |
 | S8 | Machine-readable output and logs | partial | 2/3 |
-| S9 | Test matrix and CI | remaining | 0/7 |
-| S10 | Documentation and release | partial | 2/4 |
+| S9 | Test matrix and CI | partial | 1/7 |
+| S10 | Documentation and release | partial | 3/4 |
 
 ---
 
@@ -707,21 +707,21 @@ The work is split into vertical slices, done in order. A slice is closed when ev
 
 ### Slice 9: Test matrix and CI
 
-**Files:** `.github/workflows/`, `tests/matrix/`.
+**Files:** `.github/workflows/ci.yml`, `tests/matrix/`.
 
 **What it does:** runs the suite on the supported distributions and exercises what the sandbox cannot.
 
 **Acceptance criteria:**
 
-1. [ ] **S9.1** The suite passes on Debian, Ubuntu, and on the RHEL family and Fedora.
-2. [ ] **S9.2** The `iptables` `legacy` variant passes.
-3. [ ] **S9.3** The units start under a real systemd, and a reboot restores the rules.
+1. [~] **S9.1** The suite passes on Debian, Ubuntu, and on the RHEL family and Fedora. The `suite` job of `ci.yml` runs it in six containers; it has not run yet (it needs GitHub Actions).
+2. [~] **S9.2** The `iptables` `legacy` variant passes. The `legacy` job runs the suite after switching the alternatives; it has not run yet.
+3. [~] **S9.3** The units start under a real systemd, and a reboot restores the rules. `tests/matrix/host.sh` checks the units and a restart of `bb-firewall` on a CI host; it has not run yet, and a real reboot is not covered.
 4. [ ] **S9.4** SELinux enforcing mode raises no AVC denial for `bb`.
-5. [ ] **S9.5** Docker and k3s restarts do not remove the `bb` rules.
-6. [ ] **S9.6** IPv6 traffic is blocked on a host with IPv6.
-7. [ ] **S9.7** The `wget` download path works.
+5. [~] **S9.5** Docker and k3s restarts do not remove the `bb` rules. `tests/matrix/host.sh` restarts them when present; it has not run yet.
+6. [~] **S9.6** IPv6 traffic is blocked on a host with IPv6. `tests/matrix/host.sh` checks the IPv6 sets and that loopback stays reachable; blocking of real IPv6 traffic is covered by the namespace suite, not yet on a CI host.
+7. [x] **S9.7** The `wget` download path works. (tests/cli.bats: without curl the download goes through wget with --https-only)
 
-**Tests:** CI jobs.
+**Tests:** CI jobs (`tests/matrix/`), `tests/cli.bats`.
 
 **Not to do:** support for distributions outside the two families.
 
@@ -729,7 +729,7 @@ The work is split into vertical slices, done in order. A slice is closed when ev
 
 ### Slice 10: Documentation and release
 
-**Files:** `README.md`, `LICENSE`, `CHANGELOG.md`.
+**Files:** `README.md`, `LICENSE`, `CHANGELOG.md`, `.github/workflows/release.yml`, `tests/check-release.sh`.
 
 **What it does:** the user documentation and the release.
 
@@ -737,8 +737,8 @@ The work is split into vertical slices, done in order. A slice is closed when ev
 
 1. [x] **S10.1** The README states `Status: under development`, names the license, and does not point to this file. (tests/spec.bats: README)
 2. [x] **S10.2** The repository carries the MIT license. (tests/spec.bats: license)
-3. [ ] **S10.3** `CHANGELOG.md` follows Keep a Changelog.
-4. [ ] **S10.4** A tag produces a release with checksums, and the version in the CHANGELOG and in the tag agree.
+3. [x] **S10.3** `CHANGELOG.md` follows Keep a Changelog. (tests/spec.bats: CHANGELOG.md follows Keep a Changelog)
+4. [~] **S10.4** A tag produces a release with checksums, and the version in the CHANGELOG and in the tag agree. The check and the archive with `SHA256SUMS` are tested; the publishing step of `release.yml` has not run yet. (tests/spec.bats: release check: the tag, BB_VERSION and the CHANGELOG must agree)
 
 **Tests:** `tests/spec.bats`.
 

@@ -1,0 +1,27 @@
+name: release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag, BB_VERSION and CHANGELOG must agree
+        run: bash tests/check-release.sh "$GITHUB_REF_NAME"
+      - name: Test
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bats jq shellcheck nftables iptables ipset socat iputils-ping netcat-openbsd
+          sudo make test
+      - name: Build the archive and the checksums
+        run: make dist TAG="$GITHUB_REF_NAME"
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          v=${GITHUB_REF_NAME#v}
+          notes=$(awk -v v="$v" '$0 ~ "^## \\[" v "\\]" { on = 1; next } on && /^## / { exit } on' CHANGELOG.md)
+          gh release create "$GITHUB_REF_NAME" dist/* --title "bb $v" --notes "$notes"

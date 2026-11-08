@@ -1,0 +1,42 @@
+name: ci
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo bash tests/matrix/deps.sh
+      - run: make lint && make spec
+  suite:                       # S9.1: Debian, Ubuntu, RHEL family and Fedora
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ['debian:13', 'debian:12', 'ubuntu:24.04', 'fedora:latest', 'rockylinux:9', 'almalinux:9']
+    container:
+      image: ${{ matrix.image }}
+      options: --privileged
+    steps:
+      - run: (command -v apt-get >/dev/null && apt-get update -qq && apt-get install -y -qq git) || dnf install -y git
+      - uses: actions/checkout@v4
+      - run: bash tests/matrix/deps.sh
+      - run: tests/run.sh
+  legacy:                      # S9.2
+    runs-on: ubuntu-24.04
+    container:
+      image: debian:12
+      options: --privileged
+    steps:
+      - run: apt-get update -qq && apt-get install -y -qq git
+      - uses: actions/checkout@v4
+      - run: bash tests/matrix/deps.sh
+      - run: bash tests/matrix/legacy.sh
+  host:                        # S9.3, S9.5, S9.6 on a real systemd host with Docker
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo bash tests/matrix/deps.sh
+      - run: sudo bash tests/matrix/host.sh

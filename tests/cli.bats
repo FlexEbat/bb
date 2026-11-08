@@ -153,6 +153,23 @@ teardown() { teardown_root; }
 	[ ! -e "$BB_CONF_DIR/lists.d/x.conf" ]
 }
 
+@test "lists: without curl the download goes through wget with --https-only (S9.7)" {
+	bb __init-config --backend nft
+	cat >"$R/stubs/wget" <<STUB
+#!/bin/sh
+echo "\$*" >>"$R/wget.args"
+printf '198.51.100.30\n198.51.100.31\n10.0.0.1\n'
+STUB
+	chmod +x "$R/stubs/wget"
+	printf 'curl\n' >"$R/absent"
+	export BB_TEST_ABSENT_FILE=$R/absent PATH="$R/stubs:$PATH"
+	bb list add w https://example.com/w.txt
+	bb list update w
+	grep -q -- '--https-only' "$R/wget.args"
+	run cat "$BB_STATE_DIR/lists/w.list"
+	[[ $output == *198.51.100.30* && $output != *10.0.0.1* ]]
+}
+
 @test "lists: https download goes through curl with https-only protocol flags" {
 	bb __init-config --backend nft
 	cat >"$R/stubs/curl" <<STUB
