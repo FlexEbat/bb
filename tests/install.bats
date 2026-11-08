@@ -31,7 +31,7 @@ has_bb_objects() { nft list tables 2>/dev/null | grep -q 'inet bb'; }
 
 @test "install (nft): config, allowlist, rules in monitor mode, units, no leftovers" {
 	topo_up; ip route add default via 198.51.100.2
-	SSH_CONNECTION="203.0.113.9 5555 198.51.100.1 22" run bb install --backend nft --yes --iface bbv0
+	SSH_CONNECTION="203.0.113.9 5555 198.51.100.1 22" run bb install --no-dpi --backend nft --yes --iface bbv0
 	[ "$status" -eq 0 ]
 	[[ $output == *"Self-check passed."* ]]
 	grep -q "^backend='nft'" "$BB_CONF_DIR/bb.conf"
@@ -53,7 +53,7 @@ has_bb_objects() { nft list tables 2>/dev/null | grep -q 'inet bb'; }
 }
 
 @test "install (iptables): sets service is created and wired in" {
-	run bb install --backend iptables --yes --iface lo
+	run bb install --no-dpi --backend iptables --yes --iface lo
 	[ "$status" -eq 0 ]
 	[ -s "$BB_UNIT_DIR/bb-sets.service" ]
 	grep -q '^Wants=bb-sets.service' "$BB_UNIT_DIR/bb-firewall.service"
@@ -88,10 +88,10 @@ has_bb_objects() { nft list tables 2>/dev/null | grep -q 'inet bb'; }
 }
 
 @test "install is repeatable: keeps bans and allowlist, no duplicates" {
-	bb install --backend nft --yes --iface lo
+	bb install --no-dpi --backend nft --yes --iface lo
 	bb ban 198.51.100.7
 	bb allow 192.0.2.0/24
-	bb install --backend nft --yes --iface lo
+	bb install --no-dpi --backend nft --yes --iface lo
 	run bb status; [[ $output == *"Rules: active"* ]]
 	[ "$(grep -c '^198.51.100.7 ' "$BB_CONF_DIR/manual.list")" -eq 1 ]
 	[ "$(grep -c '^192.0.2.0/24$' "$BB_CONF_DIR/allow.list")" -eq 1 ]
@@ -106,7 +106,7 @@ echo "apt-get \$*" >>"$R/pkg.log"
 : >"$R/absent"
 STUB
 	chmod +x "$R/stubs/apt-get"
-	run bb install --yes --iface lo
+	run bb install --no-dpi --yes --iface lo
 	[ "$status" -eq 0 ]
 	grep -q 'apt-get install -y nftables' "$R/pkg.log"
 	grep -q 'iproute2' "$R/pkg.log"
@@ -123,7 +123,7 @@ echo "dnf \$*" >>"$R/pkg.log"
 : >"$R/absent"
 STUB
 	chmod +x "$R/stubs/dnf"
-	run bb install --backend iptables --yes --iface lo
+	run bb install --no-dpi --backend iptables --yes --iface lo
 	[ "$status" -eq 0 ]
 	grep -q 'dnf install -y iptables-nft ipset' "$R/pkg.log"
 	grep -q 'iproute' "$R/pkg.log"
@@ -132,7 +132,7 @@ STUB
 @test "packages: a failing install changes nothing" {
 	printf 'nft\n' >"$R/absent"; export BB_TEST_ABSENT_FILE=$R/absent
 	printf '#!/bin/sh\nexit 100\n' >"$R/stubs/apt-get"; chmod +x "$R/stubs/apt-get"
-	run bb install --backend nft --yes --iface lo
+	run bb install --no-dpi --backend nft --yes --iface lo
 	[ "$status" -ne 0 ]
 	[[ $output == *"nothing was changed"* ]]
 	[ ! -e "$BB_CONF_DIR/bb.conf" ]
@@ -142,18 +142,18 @@ STUB
 
 @test "platform: unknown distribution stops unless --force" {
 	printf 'ID=arch\n' >"$BB_OS_RELEASE"
-	run bb install --backend nft --yes --iface lo
+	run bb install --no-dpi --backend nft --yes --iface lo
 	[ "$status" -ne 0 ]
 	[[ $output == *"unsupported distribution"* ]]
 	refute has_bb_objects
-	run bb install --backend nft --yes --iface lo --force
+	run bb install --no-dpi --backend nft --yes --iface lo --force
 	[ "$status" -eq 0 ]
 }
 
 @test "arguments are validated before anything changes" {
 	for args in "--ports-mode only" "--ports-mode only --ports 99999" "--ports 6881-6880 --ports-mode only" "--ports-mode sideways" "--iface bad;name" "--backend pf"; do
 		# shellcheck disable=SC2086
-		run bb install --yes --iface lo $args
+		run bb install --no-dpi --yes --iface lo $args
 		[ "$status" -ne 0 ]
 	done
 	[ ! -e "$BB_CONF_DIR/bb.conf" ]
@@ -161,7 +161,7 @@ STUB
 }
 
 @test "port mode flags end up in the config and in the rules" {
-	bb install --backend nft --yes --iface lo --ports-mode except --ports 6881-6889,51413
+	bb install --no-dpi --backend nft --yes --iface lo --ports-mode except --ports 6881-6889,51413
 	grep -q "^ports_mode='except'" "$BB_CONF_DIR/bb.conf"
 	grep -q "^ports='6881-6889,51413'" "$BB_CONF_DIR/bb.conf"
 	run nft list chain inet bb bb_dht
@@ -170,7 +170,7 @@ STUB
 
 @test "failed self-check keeps the backup and says where it is" {
 	touch "$R/enabled.fail"
-	run bb install --backend nft --yes --iface lo
+	run bb install --no-dpi --backend nft --yes --iface lo
 	[ "$status" -ne 0 ]
 	[[ $output == *"self-check failed"* ]]
 	[[ $output == *"is not enabled"* ]]
@@ -179,7 +179,7 @@ STUB
 }
 
 @test "install output is fully Russian with --lang ru" {
-	run bb install --lang ru --backend nft --yes --iface lo
+	run bb install --no-dpi --lang ru --backend nft --yes --iface lo
 	[ "$status" -eq 0 ]
 	[[ $output == *"Самопроверка пройдена."* ]]
 	[[ $output == *"Резервная копия"* ]]
@@ -208,7 +208,7 @@ add mine 5.6.7.8
 SAVE
 	chmod 640 "$R/saved/rules.v4"
 	export BB_SAVED_FILES="$R/saved/rules.v4 $R/saved/ipsets $R/saved/missing"
-	bb install --backend iptables --yes --iface lo
+	bb install --no-dpi --backend iptables --yes --iface lo
 	nft add table inet foreign
 	iptables -t filter -A INPUT -s 8.8.4.4 -j DROP
 	ipset create foreign_set hash:ip
@@ -230,7 +230,7 @@ SAVE
 }
 
 @test "uninstall needs --yes without a terminal, then removes configuration, state and the lock" {
-	bb install --backend nft --yes --iface lo
+	bb install --no-dpi --backend nft --yes --iface lo
 	run bb uninstall </dev/null
 	[ "$status" -ne 0 ]
 	has_bb_objects
@@ -242,57 +242,9 @@ SAVE
 }
 
 # ---- packages that bb itself installed ------------------------------------------------------------
-pkg_stubs() { # $1 = apt | dnf
-	: >"$R/pkgs.state"; : >"$R/pkgs.extra"; : >"$R/absent"
-	export BB_TEST_ABSENT_FILE=$R/absent
-	if [ "$1" = apt ]; then
-		cat >"$R/stubs/dpkg-query" <<STUB
-#!/bin/sh
-sort -u "$R/pkgs.state"
-STUB
-		cat >"$R/stubs/apt-get" <<STUB
-#!/bin/sh
-echo "apt-get \$*" >>"$R/pkg.log"
-sim=0; [ "\$1" = -s ] && { sim=1; shift; }
-cmd=\$1; shift
-case "\$cmd" in
-	install) for a in "\$@"; do case "\$a" in -*) ;; *) echo "\$a" >>"$R/pkgs.state"; echo "\$a-deps" >>"$R/pkgs.state" ;; esac; done; : >"$R/absent" ;;
-	purge)
-		if [ \$sim = 1 ]; then
-			for a in "\$@"; do case "\$a" in -*) ;; *) grep -qx "\$a" "$R/pkgs.state" && echo "Remv \$a [1.0]" ;; esac; done
-			sed 's/^/Remv /' "$R/pkgs.extra"
-		else
-			for a in "\$@"; do case "\$a" in -*) ;; *) sed -i "/^\$a\$/d" "$R/pkgs.state" ;; esac; done
-		fi ;;
-esac
-STUB
-		printf 'ID=debian\n' >"$BB_OS_RELEASE"
-	else
-		cat >"$R/stubs/rpm" <<STUB
-#!/bin/sh
-case "\$1" in
-	-qa) sort -u "$R/pkgs.state" ;;
-	-q) cat "$R/pkgs.extra" ;;
-esac
-STUB
-		cat >"$R/stubs/dnf" <<STUB
-#!/bin/sh
-echo "dnf \$*" >>"$R/pkg.log"
-cmd=\$1; shift
-case "\$cmd" in
-	install) for a in "\$@"; do case "\$a" in -*) ;; *) echo "\$a" >>"$R/pkgs.state"; echo "\$a-deps" >>"$R/pkgs.state" ;; esac; done; : >"$R/absent" ;;
-	remove) for a in "\$@"; do case "\$a" in -*) ;; *) sed -i "/^\$a\$/d" "$R/pkgs.state" ;; esac; done ;;
-esac
-STUB
-		printf 'ID=rocky\nID_LIKE="rhel centos fedora"\n' >"$BB_OS_RELEASE"
-	fi
-	chmod +x "$R/stubs/"*
-	echo libpreexisting >>"$R/pkgs.state"
-}
-
 @test "uninstall (apt) removes the packages bb installed, dependencies included, and nothing else" {
 	pkg_stubs apt; printf 'nft\n' >"$R/absent"
-	bb install --backend nft --yes --iface lo >/dev/null
+	bb install --no-dpi --backend nft --yes --iface lo >/dev/null
 	grep -qx 'pkg apt:nftables' "$BB_STATE_DIR/manifest"
 	grep -qx 'pkg apt:nftables-deps' "$BB_STATE_DIR/manifest"          # a dependency pulled in by the install
 	refute grep -q 'libpreexisting' "$BB_STATE_DIR/manifest"          # what was there before is not ours
@@ -305,7 +257,7 @@ STUB
 
 @test "uninstall keeps a package other software depends on, and says so" {
 	pkg_stubs apt; printf 'nft\n' >"$R/absent"
-	bb install --backend nft --yes --iface lo >/dev/null
+	bb install --no-dpi --backend nft --yes --iface lo >/dev/null
 	printf 'firewalld\n' >"$R/pkgs.extra"                              # purging would also remove firewalld
 	run bb uninstall --yes
 	[ "$status" -eq 0 ]
@@ -317,7 +269,7 @@ STUB
 
 @test "uninstall --keep-packages leaves packages alone" {
 	pkg_stubs apt; printf 'nft\n' >"$R/absent"
-	bb install --backend nft --yes --iface lo >/dev/null
+	bb install --no-dpi --backend nft --yes --iface lo >/dev/null
 	run bb uninstall --yes --keep-packages
 	[ "$status" -eq 0 ]
 	refute grep -q 'apt-get' <(grep -v 'install' "$R/pkg.log")
@@ -326,7 +278,7 @@ STUB
 
 @test "uninstall (dnf) removes what bb installed unless something requires it" {
 	pkg_stubs dnf; printf 'nft\n' >"$R/absent"
-	bb install --backend nft --yes --iface lo >/dev/null
+	bb install --no-dpi --backend nft --yes --iface lo >/dev/null
 	grep -qx 'pkg dnf:nftables' "$BB_STATE_DIR/manifest"
 	run bb uninstall --yes
 	[[ $output == *"Removed the packages bb had installed"* ]]
@@ -336,7 +288,7 @@ STUB
 
 @test "uninstall (dnf) keeps packages that other installed software requires" {
 	pkg_stubs dnf; printf 'nft\n' >"$R/absent"
-	bb install --backend nft --yes --iface lo >/dev/null
+	bb install --no-dpi --backend nft --yes --iface lo >/dev/null
 	printf 'firewalld\n' >"$R/pkgs.extra"
 	run bb uninstall --yes
 	[[ $output == *"Kept the packages bb had installed"* ]]
@@ -351,13 +303,13 @@ echo "apt-get \$*" >>"$R/pkg.log"
 [ "\$1" = install ] && { echo nftables >>"$R/pkgs.state"; exit 100; }
 exit 0
 STUB
-	run bb install --backend nft --yes --iface lo
+	run bb install --no-dpi --backend nft --yes --iface lo
 	[ "$status" -ne 0 ]
 	grep -qx 'pkg apt:nftables' "$BB_STATE_DIR/manifest"
 }
 
 @test "an unconfirmed block mode is reverted by apply/guard when the timer is gone" {
-	bb install --backend nft --yes --iface lo
+	bb install --no-dpi --backend nft --yes --iface lo
 	touch "$R/timer.active"
 	bb mode block --confirm 30
 	[ -e "$BB_STATE_DIR/mode.pending" ]
@@ -371,7 +323,7 @@ STUB
 }
 
 @test "confirm clears the pending marker so block survives a reboot" {
-	bb install --backend nft --yes --iface lo
+	bb install --no-dpi --backend nft --yes --iface lo
 	touch "$R/timer.active"
 	bb mode block --confirm 30
 	bb mode confirm
@@ -382,7 +334,7 @@ STUB
 }
 
 @test "boot path: __sets-restore recreates sets and bans without any rules" {
-	bb install --backend iptables --yes --iface lo
+	bb install --no-dpi --backend iptables --yes --iface lo
 	bb ban 198.51.100.7
 	bb __remove
 	run iptables -t raw -S; [[ $output != *BB_FILTER* ]]
@@ -395,7 +347,7 @@ STUB
 
 @test "backend: iptables without the nftables package is used as is, and jq is not installed in basic mode" {
 	pkg_stubs apt; printf 'nft\n' >"$R/absent"
-	run bb install --yes --iface lo
+	run bb install --no-dpi --yes --iface lo
 	[ "$status" -eq 0 ]
 	grep -q "^backend='iptables'" "$BB_CONF_DIR/bb.conf"
 	[[ $output == *"Nothing to install."* ]]
@@ -405,7 +357,7 @@ STUB
 
 @test "install without working DNS still completes: the empty DHT set is only a warning" {
 	printf 'unresolvable.invalid:6881\n' >"$BB_CONF_DIR/dht.nodes" 2>/dev/null || { mkdir -p "$BB_CONF_DIR"; printf 'unresolvable.invalid:6881\n' >"$BB_CONF_DIR/dht.nodes"; }
-	run bb install --backend nft --yes --iface lo
+	run bb install --no-dpi --backend nft --yes --iface lo
 	[ "$status" -eq 0 ]
 	[[ $output == *"the DHT set is empty"* && $output == *"Self-check passed."* ]]
 }

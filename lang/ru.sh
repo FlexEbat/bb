@@ -96,6 +96,7 @@ MSG[help_main]="bb - лёгкий блокировщик BitTorrent, DHT и чё
   list [add|update|rm]        внешние чёрные списки и DHT-узлы
   notify setup|test|status    уведомления в Telegram / Matrix
   integrate [auto|docker|...] Docker, k3s/k8s, ufw, firewalld   doctor   диагностика
+  show flows                  потоки, добавленные анализом трафика
   lang [en|ru]                показать или сменить язык интерфейса
 
 Глобальный параметр: --lang en|ru"
@@ -158,7 +159,6 @@ MSG[inst_prompt_ports]="Порты, например 6881-6889,51413 [%s]:"
 MSG[inst_backup]="Резервная копия текущего состояния: %s"
 MSG[inst_backup_kept]="Резервная копия сохранена: %s"
 MSG[inst_allow_added]="Добавлено в список исключений: %s"
-MSG[inst_dpi_later]="Анализ трафика (nDPId) в этой версии недоступен; используются списки, DHT-узлы и ручные блокировки."
 MSG[inst_units]="Юниты systemd установлены и включены."
 MSG[inst_check_ok]="Самопроверка пройдена."
 MSG[inst_done]="bb установлен в режиме monitor (пишет в журнал и считает, ничего не отбрасывает). Посмотрите «bb status», затем выполните «bb mode block --confirm 60»."
@@ -307,3 +307,36 @@ MSG[help_doctor]="Использование: bb doctor
 Проверяет бэкенд, поддержку в ядре, правила и их положение, юниты, список исключений, известные
 конфликты (nftables.service, Docker, k8s, ufw, firewalld, fail2ban и др.), SELinux, права файлов,
 очередь уведомлений и каталоги языков. При любом СБОЕ код возврата 1."
+
+MSG[err_dpi_build]="не удалось собрать nDPId; межсетевой экран не изменён. Журнал: %s (с параметром --no-dpi можно продолжить без анализа трафика)"
+MSG[err_dpi_flag]="в справке nDPId не найден параметр фильтра захвата; используйте --ports-mode all или --no-dpi"
+MSG[err_dpi_user]="не удалось создать пользователя %s"
+MSG[inst_prompt_dpi]="Включить анализ трафика через nDPId (он собирается из исходников)? [Y/n]"
+MSG[dpi_step_deps]="Установка пакетов для сборки"
+MSG[dpi_step_build]="Сборка nDPId"
+MSG[dpi_present]="nDPId уже установлен; сборка пропущена."
+MSG[dpi_built]="nDPId %s собран и установлен: %s"
+MSG[inst_dpi_on]="Анализ трафика: nDPId %s, фильтр захвата: %s"
+MSG[inst_dpi_off]="Анализ трафика выключен (статический режим: списки, DHT-узлы и ручные блокировки)."
+MSG[word_none]="нет"
+MSG[chk_dpi_bin]="nDPId не установлен или не запускается"
+MSG[chk_dpi_user]="пользователь %s отсутствует"
+MSG[chk_dpi_conf]="отсутствует конфигурация слушателя"
+
+MSG[show_flows_head]="Динамические потоки (набор, запись, осталось секунд):"
+MSG[show_flows_none]="Динамических потоков нет."
+MSG[show_flow_line]="  %-10s %s  %s с"
+
+MSG[doc_dpi_bin_ok]="nDPId %s установлен и запускается"
+MSG[doc_dpi_bin_fail]="nDPId отсутствует или не запускается: %s"
+MSG[doc_dpi_jq_ok]="jq установлен (он нужен слушателю)"
+MSG[doc_dpi_jq_fail]="jq отсутствует: слушатель не может разбирать события"
+MSG[doc_dpi_user_fail]="пользователь %s не существует"
+MSG[doc_dpi_notrunning]="nDPId не запущен"
+MSG[doc_dpi_conf_ok]="listener.conf принадлежит root:bb, режим 0640"
+MSG[doc_dpi_conf_fail]="listener.conf должен принадлежать root:bb с режимом 0640 (сейчас %s)"
+MSG[doc_dpi_dir_warn]="каталог слушателя отсутствует или принадлежит не bb"
+
+MSG[help_show]="Использование: bb show flows
+
+Показывает потоки, которые добавил анализ трафика (динамические наборы), и сколько секунд осталось у каждого."

@@ -1,0 +1,11 @@
+ndpid-1.7.raw is the byte stream that the real nDPId 1.7 (tag 1.7, commit
+9969f955dc0062582256570960277ad86f40523b, nDPI 4.11.0) sent to a unix socket while reading
+bt.pcap:
+
+    nDPId -i bt.pcap -c <socket> -o max-reader-threads=1
+
+bt.pcap is synthetic (gen_pcap.py, a one-off development tool; the product and the test suite
+do not use Python): a BitTorrent handshake over TCP on IPv4 and on IPv6, DHT over UDP, and one
+plain HTTP flow. The stream holds 56 frames; the length of each frame includes the JSON's
+trailing newline. The tests feed it to the listener to prove that the listener understands the
+real format, not just a format that was assumed.

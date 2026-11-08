@@ -97,6 +97,7 @@ Usage: bb COMMAND [options]       (add --help to any command)
   list [add|update|rm]        external blocklists and DHT nodes
   notify setup|test|status    Telegram / Matrix notifications
   integrate [auto|docker|...] Docker, k3s/k8s, ufw, firewalld   doctor   diagnostics
+  show flows                  flows added by traffic inspection
   lang [en|ru]                show or change the interface language
 
 Global option: --lang en|ru"
@@ -159,7 +160,6 @@ MSG[inst_prompt_ports]="Ports, e.g. 6881-6889,51413 [%s]:"
 MSG[inst_backup]="Backup of the current state: %s"
 MSG[inst_backup_kept]="The backup was kept at %s"
 MSG[inst_allow_added]="Added to the allowlist: %s"
-MSG[inst_dpi_later]="Traffic inspection (nDPId) is not available in this version; using lists, DHT nodes and manual bans."
 MSG[inst_units]="systemd units installed and enabled."
 MSG[inst_check_ok]="Self-check passed."
 MSG[inst_done]="bb is installed in monitor mode (it logs and counts, nothing is dropped). Look at 'bb status', then run 'bb mode block --confirm 60'."
@@ -307,3 +307,36 @@ MSG[help_doctor]="Usage: bb doctor
 Checks the backend, kernel support, rules and their position, units, the allowlist, known
 conflicts (nftables.service, Docker, k8s, ufw, firewalld, fail2ban, ...), SELinux, file
 permissions, the notification queue and the language catalogs. Exit code 1 on any FAIL."
+
+MSG[err_dpi_build]="building nDPId failed; the firewall was not changed. Log: %s (use --no-dpi to continue without traffic inspection)"
+MSG[err_dpi_flag]="could not find the capture-filter option in the help of nDPId; use --ports-mode all or --no-dpi"
+MSG[err_dpi_user]="could not create the user %s"
+MSG[inst_prompt_dpi]="Enable traffic inspection with nDPId (it is built from source)? [Y/n]"
+MSG[dpi_step_deps]="Installing build packages"
+MSG[dpi_step_build]="Building nDPId"
+MSG[dpi_present]="nDPId is already installed; skipping the build."
+MSG[dpi_built]="nDPId %s built and installed: %s"
+MSG[inst_dpi_on]="Traffic inspection: nDPId %s, capture filter: %s"
+MSG[inst_dpi_off]="Traffic inspection is off (static mode: lists, DHT nodes and manual bans)."
+MSG[word_none]="none"
+MSG[chk_dpi_bin]="nDPId is not installed or does not start"
+MSG[chk_dpi_user]="user %s is missing"
+MSG[chk_dpi_conf]="the listener configuration is missing"
+
+MSG[show_flows_head]="Dynamic flows (set, entry, seconds left):"
+MSG[show_flows_none]="There are no dynamic flows."
+MSG[show_flow_line]="  %-10s %s  %ss"
+
+MSG[doc_dpi_bin_ok]="nDPId %s is installed and starts"
+MSG[doc_dpi_bin_fail]="nDPId is missing or does not start: %s"
+MSG[doc_dpi_jq_ok]="jq is installed (the listener needs it)"
+MSG[doc_dpi_jq_fail]="jq is missing: the listener cannot parse events"
+MSG[doc_dpi_user_fail]="user %s does not exist"
+MSG[doc_dpi_notrunning]="nDPId is not running"
+MSG[doc_dpi_conf_ok]="listener.conf belongs to root:bb with mode 0640"
+MSG[doc_dpi_conf_fail]="listener.conf must belong to root:bb with mode 0640 (found %s)"
+MSG[doc_dpi_dir_warn]="the listener's directory is missing or not owned by bb"
+
+MSG[help_show]="Usage: bb show flows
+
+Lists the flows that traffic inspection added (the dynamic sets) with the seconds left of each."

@@ -5,6 +5,7 @@
 # Vars  : strip=1  drop private/special-purpose ranges
 #         minp4/minp6  minimum prefix accepted (too broad -> rejected)
 #         hosts=1  pass host names through ("H" records), otherwise invalid
+#         orig=1   append the input token as a third column ("4<TAB>canon<TAB>input")
 
 function hexval(h,   i, c, v, d) {
 	v = 0; h = tolower(h)
@@ -157,7 +158,7 @@ function handle(tok,   addr, plen, pos, G, M, n, net, c, host, h, pfx) {
 		if (strip && private4(net, plen)) { bump("private"); return }
 		c = v4str(net) ((plen < 32) ? "/" plen : "")
 		if (c in seen) { bump("dup"); return }
-		seen[c] = 1; bump("ok"); print "4\t" c
+		seen[c] = 1; bump("ok"); print "4\t" c (orig ? "\t" tok : "")
 		return
 	}
 	if (index(addr, ":") > 0) {
@@ -169,7 +170,7 @@ function handle(tok,   addr, plen, pos, G, M, n, net, c, host, h, pfx) {
 		if (strip && private6(M, plen)) { bump("private"); return }
 		c = v6str(M) ((plen < 128) ? "/" plen : "")
 		if (c in seen) { bump("dup"); return }
-		seen[c] = 1; bump("ok"); print "6\t" c
+		seen[c] = 1; bump("ok"); print "6\t" c (orig ? "\t" tok : "")
 		return
 	}
 	# host name

@@ -245,7 +245,7 @@ STUB
 @test "install detects integrations and says so; uninstall leaves no bb objects" {
 	mkdir -p "$R/units"; export BB_UNIT_DIR=$R/units
 	mk_if docker0 172.17.0.1/16 dkr0p
-	run bb install --backend nft --yes --iface lo
+	run bb install --no-dpi --backend nft --yes --iface lo
 	[ "$status" -eq 0 ]
 	[[ $output == *"Integrations: 1 internal networks"* ]]
 	nft list set inet bb internal4 | grep -qF 172.17.0.0/16
@@ -257,7 +257,7 @@ STUB
 # ---- bb doctor -------------------------------------------------------------------------------
 doc_install() {
 	mkdir -p "$R/units"; export BB_UNIT_DIR=$R/units
-	bb install --backend "${1:-nft}" --yes --iface lo >/dev/null
+	bb install --no-dpi --backend "${1:-nft}" --yes --iface lo >/dev/null
 	bb allow 192.0.2.1 >/dev/null
 }
 
@@ -290,7 +290,7 @@ doc_install() {
 
 @test "doctor: wiped rules are a FAIL, an empty allowlist and queued messages are warnings" {
 	mkdir -p "$R/units"; export BB_UNIT_DIR=$R/units
-	bb install --backend nft --yes --iface lo >/dev/null
+	bb install --no-dpi --backend nft --yes --iface lo >/dev/null
 	run bb doctor
 	[ "$status" -eq 0 ]
 	[[ $output == *"[warn] the allowlist is empty"* ]]
@@ -346,7 +346,7 @@ doc_install() {
 
 @test "doctor: other firewall tools and integrations are listed, ufw advice, SELinux/AVC" {
 	mkdir -p "$R/units"; export BB_UNIT_DIR=$R/units
-	bb install --backend nft --yes --iface lo >/dev/null     # allowlist stays empty on purpose
+	bb install --no-dpi --backend nft --yes --iface lo >/dev/null     # allowlist stays empty on purpose
 	iptables -N f2b-sshd; iptables -N ts-input
 	mk_if docker0 172.17.0.1/16 dkr0p
 	printf 'ENABLED=yes\n' >"$R/ufw.conf"

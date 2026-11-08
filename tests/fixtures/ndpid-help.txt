@@ -1,0 +1,65 @@
+nDPId version 1.7
+(C) 2020-2024 Toni Uhlig
+Please report any BUG to toni@impl.cc
+
+Usage: /tmp/ndpid/src/build/nDPId [-f config-file]
+[-i pcap-file/interface] [-I] [-E] [-B bpf-filter]
+	  	[-l] [-L logfile] [-c address] [-e][-d] [-p pidfile]
+	  	[-u user] [-g group] [-P path] [-C path] [-J path]
+	  	[-a instance-alias] [-A]
+	 	[-o subopt=value]
+	  	[-v] [-h]
+
+	-f	Load nDPId/libnDPI options from a configuration file.
+	-i	Interface or file from where to read packets from.
+	-I	Process only packets where the source address of the first packet
+	  	is part of the interface subnet. (Internal mode)
+	-E	Process only packets where the source address of the first packet
+	  	is *NOT* part of the interface subnet. (External mode)
+	-B	Set an optional PCAP filter string. (BPF format)
+	-l	Log all messages to stderr.
+	-L	Log all messages to a log file.
+	-c	Path to a UNIX socket (nDPIsrvd Collector) or a custom UDP endpoint.
+	  	Default: /tmp/ndpid-collector.sock
+	-e	Use poll() instead of epoll().
+	  	Default: epoll() on Linux, poll() otherwise
+	-d	Fork into background after initialization.
+	-p	Write the daemon PID to the given file path.
+	  	Default: /tmp/ndpid.pid
+	-u	Change UID to the numeric value of user.
+	  	Default: nobody
+	-g	Change GID to the numeric value of group.
+	-R	Load a nDPI custom risk domain file.
+	-P	Load a nDPI custom protocols file.
+	-C	Load a nDPI custom categories file.
+	-J	Load a nDPI JA3 hash blacklist file.
+	  	See: https://sslbl.abuse.ch/blacklist/ja3_fingerprints.csv
+	-S	Load a nDPI SSL SHA1 hash blacklist file.
+	  	See: https://sslbl.abuse.ch/blacklist/sslblacklist.csv
+	-a	Set an alias name of this daemon instance which will
+	  	be part of every JSON message.
+	  	This value is required for correct flow handling of
+	  	multiple instances and should be unique.
+	  	Defaults to your hostname.
+	-A	Enable flow analysis aka feature extraction. Requires more memory and cpu usage.
+	  	Experimental, do not rely on those values.
+	-o	(Carefully) Tune some daemon options. See subopts below.
+	-v	version
+	-h	this
+
+	subopts:
+		max-flows-per-thread = 2048
+		max-idle-flows-per-thread = 64
+		max-reader-threads = 10
+		daemon-status-interval = 600000000
+		flow-scan-interval = 10000000
+		generic-max-idle-time = 600000000
+		icmp-max-idle-time = 120000000
+		udp-max-idle-time = 180000000
+		tcp-max-idle-time = 7440000000
+		tcp-max-post-end-flow-time = 120000000
+		max-packets-per-flow-to-send = 15
+		max-packets-per-flow-to-process = 32
+		max-packets-per-flow-to-analyse = 32
+		error-event-threshold-n = 16
+		error-event-threshold-time = 10000000

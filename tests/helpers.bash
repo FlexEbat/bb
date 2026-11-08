@@ -77,3 +77,53 @@ status_count() { bb status | awk -v k="$1" '$1 == k { print $2 }'; }
 
 # "! cmd" never fails a bats test (negated commands are exempt from errexit).
 refute() { if "$@"; then echo "unexpected success: $*"; return 1; fi; }
+
+# Stubs for dpkg-query/apt-get (or rpm/dnf) that keep a package list in $R/pkgs.state.
+pkg_stubs() { # $1 = apt | dnf
+	: >"$R/pkgs.state"; : >"$R/pkgs.extra"; : >"$R/absent"
+	export BB_TEST_ABSENT_FILE=$R/absent
+	if [ "$1" = apt ]; then
+		cat >"$R/stubs/dpkg-query" <<STUB
+#!/bin/sh
+sort -u "$R/pkgs.state"
+STUB
+		cat >"$R/stubs/apt-get" <<STUB
+#!/bin/sh
+echo "apt-get \$*" >>"$R/pkg.log"
+sim=0; [ "\$1" = -s ] && { sim=1; shift; }
+cmd=\$1; shift
+case "\$cmd" in
+	install) for a in "\$@"; do case "\$a" in -*) ;; *) echo "\$a" >>"$R/pkgs.state"; echo "\$a-deps" >>"$R/pkgs.state" ;; esac; done; : >"$R/absent" ;;
+	purge)
+		if [ \$sim = 1 ]; then
+			for a in "\$@"; do case "\$a" in -*) ;; *) grep -qx "\$a" "$R/pkgs.state" && echo "Remv \$a [1.0]" ;; esac; done
+			sed 's/^/Remv /' "$R/pkgs.extra"
+		else
+			for a in "\$@"; do case "\$a" in -*) ;; *) sed -i "/^\$a\$/d" "$R/pkgs.state" ;; esac; done
+		fi ;;
+esac
+STUB
+		printf 'ID=debian\n' >"$BB_OS_RELEASE"
+	else
+		cat >"$R/stubs/rpm" <<STUB
+#!/bin/sh
+case "\$1" in
+	-qa) sort -u "$R/pkgs.state" ;;
+	-q) cat "$R/pkgs.extra" ;;
+esac
+STUB
+		cat >"$R/stubs/dnf" <<STUB
+#!/bin/sh
+echo "dnf \$*" >>"$R/pkg.log"
+cmd=\$1; shift
+case "\$cmd" in
+	install) for a in "\$@"; do case "\$a" in -*) ;; *) echo "\$a" >>"$R/pkgs.state"; echo "\$a-deps" >>"$R/pkgs.state" ;; esac; done; : >"$R/absent" ;;
+	remove) for a in "\$@"; do case "\$a" in -*) ;; *) sed -i "/^\$a\$/d" "$R/pkgs.state" ;; esac; done ;;
+esac
+STUB
+		printf 'ID=rocky\nID_LIKE="rhel centos fedora"\n' >"$BB_OS_RELEASE"
+	fi
+	chmod +x "$R/stubs/"*
+	echo libpreexisting >>"$R/pkgs.state"
+}
+

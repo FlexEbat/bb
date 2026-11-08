@@ -58,6 +58,10 @@ else
 fi
 PENDING_FILE=$STATE_DIR/mode.pending
 MANIFEST=$STATE_DIR/manifest
+LISTENER_DIR=$STATE_DIR/listener
+LISTENER_CONF=$STATE_DIR/listener.conf
+FLOWS_SAVE=$STATE_DIR/flows.save
+DPI_LOG=$STATE_DIR/dpi-build.log
 NOTIFY_CONF=$CONF_DIR/notify.conf
 NOTIFY_QUEUE=$STATE_DIR/notify.queue
 NOTIFY_DEDUP=$STATE_DIR/notify.dedup
@@ -136,6 +140,7 @@ have() {
 	command -v "$1" >/dev/null 2>&1
 }
 
+TMP_BASE=""
 cleanup() {
 	[[ -n $TMPD && -d $TMPD ]] && rm -rf -- "$TMPD"
 	return 0
@@ -144,8 +149,9 @@ trap cleanup EXIT
 
 mk_tmpdir() {
 	[[ -n $TMPD ]] && return 0
-	mkdir -p -- "$STATE_DIR" || die err_mkdir "$STATE_DIR"
-	TMPD=$(mktemp -d "$STATE_DIR/tmp.XXXXXX") || die err_mkdir "$STATE_DIR"
+	local base=${TMP_BASE:-$STATE_DIR}
+	mkdir -p -- "$base" || die err_mkdir "$base"
+	TMPD=$(mktemp -d "$base/tmp.XXXXXX") || die err_mkdir "$base"
 }
 
 # ---------------------------------------------------------------------------
@@ -427,6 +433,7 @@ fw_rollback() { "${FW}_rollback" "$@"; }
 set_replace() { "${FW}_set_replace" "$@"; } # kind fam file
 set_add() { "${FW}_set_add" "$@"; }         # kind fam entry [ttl_seconds]
 set_del() { "${FW}_set_del" "$@"; }         # kind fam entry
+set_test() { "${FW}_set_test" "$@"; }       # kind fam addr: is the address in the live set?
 flow_add() { "${FW}_flow_add" "$@"; }       # fam src sport dst dport proto ttl
 
 # Ports for the DHT rule, canonical "6881-6889,51413".
@@ -618,6 +625,8 @@ ipt_set_add() { # kind fam entry [ttl]
 	if [[ -n ${4:-} ]]; then ipset add -exist "$name" "$3" timeout "$4" 2>/dev/null
 	else ipset add -exist "$name" "$3" 2>/dev/null; fi
 }
+
+ipt_set_test() { ipset test "$(ipt_set "$1" "$2")" "$3" >/dev/null 2>&1; }
 
 ipt_set_del() { ipset del "$(ipt_set "$1" "$2")" "$3" 2>/dev/null; }
 
@@ -827,6 +836,8 @@ nft_set_add() { # kind fam entry [ttl]
 	fi
 }
 
+nft_set_test() { nft get element inet bb "$1$2" "{ $3 }" >/dev/null 2>&1; }
+
 nft_set_del() { nft delete element inet bb "$1$2" "{ $(nft_elem "$1" "$3") }" 2>/dev/null; }
 
 nft_flow_add() { # fam src sport dst dport proto ttl
@@ -920,6 +931,7 @@ sets_load_all() {
 	done
 	sets_refresh list || rc=1
 	sets_refresh dht || rc=1
+	flows_restore_if_empty
 	return "$rc"
 }
 
@@ -1142,6 +1154,7 @@ do_apply() {
 	mkdir -p -- "$bdir"
 	fw_backup "$bdir"
 	fw_init || return 1
+	[[ ${CFG[dpi]} == yes ]] && listener_conf_write
 	if ! sets_load_all; then fw_rollback "$bdir"; return 1; fi
 	if ! fw_apply; then
 		err err_apply_failed
@@ -1171,6 +1184,7 @@ cmd_guard() {
 	fi
 	notify_allow_refresh
 	integrations_refresh
+	listener_events_flush
 	notify_kick # retries queued messages and sends the "suppressed" summary
 	return 0
 }
@@ -2304,6 +2318,26 @@ doctor_files() {
 	return 0
 }
 
+doctor_dpi() {
+	local u m own ver
+	[[ ${CFG[dpi]} == yes ]] || return 0
+	if dpi_binary_ok; then
+		ver=$(cut -d' ' -f1 "$STATE_DIR/ndpid.version" 2>/dev/null)
+		doc ok doc_dpi_bin_ok "${ver:-?}"
+	else doc fail doc_dpi_bin_fail "$NDPID_BIN"; fi
+	have jq && doc ok doc_dpi_jq_ok || doc fail doc_dpi_jq_fail
+	for u in bb bb-ndpid; do getent passwd "$u" >/dev/null 2>&1 || doc fail doc_dpi_user_fail "$u"; done
+	if have_systemd && have systemctl; then
+		for u in bb-listener.socket bb-ndpid.service; do
+			if systemctl is-enabled --quiet "$u" 2>/dev/null; then doc ok doc_unit_ok "$u"; else doc fail doc_unit_fail "$u"; fi
+		done
+		systemctl is-active --quiet bb-ndpid.service 2>/dev/null || doc warn doc_dpi_notrunning
+	fi
+	m=$(stat -c %a "$LISTENER_CONF" 2>/dev/null) own=$(stat -c %U:%G "$LISTENER_CONF" 2>/dev/null)
+	if [[ $m == 640 && $own == root:bb ]]; then doc ok doc_dpi_conf_ok; else doc fail doc_dpi_conf_fail "${own:-?} ${m:-?}"; fi
+	[[ -d $LISTENER_DIR && $(stat -c %U "$LISTENER_DIR" 2>/dev/null) == bb ]] || doc warn doc_dpi_dir_warn
+}
+
 cmd_doctor() {
 	need_root; cfg_load || true
 	[[ -n ${CFG[backend]} ]] && fw_select
@@ -2315,16 +2349,356 @@ cmd_doctor() {
 	doctor_allow
 	doctor_conflicts
 	doctor_integrations
+	doctor_dpi
 	doctor_selinux
 	doctor_files
 	say doc_summary "$DOC_FAIL" "$DOC_WARN"
 	((DOC_FAIL == 0))
 }
 
+# ---- dynamic layer: the listener and the flow sets (tech.md section 6.4) ------------------------------
+# nDPId (running as its own user) writes frames "<5 digits><JSON>" to a unix socket; systemd starts one
+# listener per connection. The listener runs as the unprivileged user "bb" with CAP_NET_ADMIN only:
+#   frames -> jq (the only JSON parser) -> validated flow lines -> kernel sets.
+# Verified against nDPId 1.7: the 5-digit length INCLUDES the JSON's trailing newline.
+
+# jq reads raw lines, so a corrupt line is skipped instead of ending the stream.
+LISTENER_JQ='
+def v4: type == "string" and test("^[0-9]{1,3}(\\.[0-9]{1,3}){3}$") and (split(".") | all(.[]; tonumber <= 255));
+def v6: type == "string" and test("^[0-9A-Fa-f:]{2,39}$") and contains(":");
+def port: type == "number" and . == floor and . >= 1 and . <= 65535;
+(try fromjson catch empty)
+| select(type == "object")
+| select(.flow_event_name == "detected" or .flow_event_name == "detection-update")
+| select((.ndpi | type) == "object" and (.ndpi.proto | type) == "string" and (.ndpi.proto | ascii_downcase | contains("bittorrent")))
+| select(.l4_proto == "tcp" or .l4_proto == "udp")
+| select((.src_port | port) and (.dst_port | port))
+| (if (.src_ip | v4) and (.dst_ip | v4) then "4" elif (.src_ip | v6) and (.dst_ip | v6) then "6" else empty end) as $f
+| "\($f) \(.src_ip),\(.l4_proto):\(.src_port) \(.dst_ip),\(.l4_proto):\(.dst_port)"'
+
+# stdin: the nDPId stream. stdout: one JSON document per line. Any protocol violation ends the
+# connection (nDPId reconnects); nothing from the stream is ever executed or interpolated.
+listener_frames() {
+	local hdr payload len max=${CFG[max_event_size]}
+	while IFS= read -r -N 5 hdr; do
+		if [[ ! $hdr =~ ^[0-9]{5}$ ]]; then log_event "listener_frame_error reason=header"; return 1; fi
+		len=$((10#$hdr))
+		if ((len < 1 || len > max)); then log_event "listener_frame_error reason=length"; return 1; fi
+		if ! IFS= read -r -N "$len" payload || ((${#payload} != len)); then
+			log_event "listener_frame_error reason=truncated"; return 1
+		fi
+		payload=${payload//$'\n'/ } # the trailing newline counted in the length
+		printf '%s\n' "$payload"
+	done
+	return 0
+}
+
+# One validated candidate "fam sip proto sp dip dp" goes into BATCH unless it is a repeat or
+# the rate limit is exceeded (then the flow is dropped and rate_limit is raised once a minute).
+listener_line() {
+	local line=$1 fam sip sp dip dp proto p2 now key minute
+	[[ $line =~ ^([46])\ ([0-9A-Fa-f:.]+),(tcp|udp):([0-9]{1,5})\ ([0-9A-Fa-f:.]+),(tcp|udp):([0-9]{1,5})$ ]] || return 0
+	fam=${BASH_REMATCH[1]} sip=${BASH_REMATCH[2]} proto=${BASH_REMATCH[3]} sp=${BASH_REMATCH[4]}
+	dip=${BASH_REMATCH[5]} p2=${BASH_REMATCH[6]} dp=${BASH_REMATCH[7]}
+	[[ $proto == "$p2" ]] || return 0
+	sp=$((10#$sp)) dp=$((10#$dp))
+	((sp >= 1 && sp <= 65535 && dp >= 1 && dp <= 65535)) || return 0
+	[[ $fam == 6 && ${CFG[ipv6]} != yes ]] && return 0
+	printf -v now '%(%s)T' -1
+	key="$fam $sip $proto $sp $dip $dp"
+	[[ -n ${SEEN[$key]+x} ]] && ((SEEN[$key] > now)) && return 0
+	minute=$((now / 60))
+	if ((minute != CUR_MIN)); then CUR_MIN=$minute MIN_COUNT=0 PAUSE_LOGGED=0; fi
+	MIN_COUNT=$((MIN_COUNT + 1))
+	if ((MIN_COUNT > ${CFG[flow_rate_limit]})); then
+		if ((PAUSE_LOGGED == 0)); then
+			PAUSE_LOGGED=1
+			printf 'rate_limit %s\n' "$now" >>"$LISTENER_DIR/events"
+			log_event "rate_limit limit=${CFG[flow_rate_limit]}"
+		fi
+		return 0
+	fi
+	((${#SEEN[@]} >= 100000)) && SEEN=() # bounded memory
+	SEEN[$key]=$((now + $(dur2sec "${CFG[flow_dedup]}s" 2>/dev/null || printf 600)))
+	BATCH+=("$fam $sip $proto $sp $dip $dp")
+}
+
+# Adds flows: one ipset restore / one nft transaction. Plain "add" refreshes the timeout of an
+# element that already exists, on both backends.
+flows_apply() { # file ttl
+	local file=$1 ttl=$2
+	[[ -s $file ]] || return 0
+	if [[ $FW == ipt ]]; then
+		awk -v t="$ttl" '{ print "add bb_flow_src" $1 " " $3 "," $2 ":" $4 " timeout " t
+		                   print "add bb_flow_dst" $1 " " $5 "," $2 ":" $6 " timeout " t }' "$file" | ipset restore -exist 2>/dev/null
+	else
+		awk -v t="$ttl" '
+			{ f = $1; buf[f] = buf[f] (n[f]++ ? ", " : "") $3 " . " $4 " . " $5 " . " $6 " timeout " t "s"
+			  if (n[f] == 500) { print "add element inet bb flow" f " { " buf[f] " }"; n[f] = 0; buf[f] = "" } }
+			END { for (f in buf) if (n[f]) print "add element inet bb flow" f " { " buf[f] " }" }' "$file" | nft -f - 2>/dev/null
+	fi
+}
+
+# Second validation, in bash/awk: canonical form, private and special ranges dropped, the
+# allowlist consulted in the kernel set (so it is always current), then one batched apply.
+listener_flush() {
+	((${#BATCH[@]})) || return 0
+	local entry f sip proto sp dip dp sc dc n=0 ttl f6 s6 d6
+	local -A CANON=() ALLOWED=()
+	mk_tmpdir
+	printf '%s\n' "${BATCH[@]}" | awk '{ print $2; print $5 }' |
+		awk -v strip=1 -v orig=1 -v minp4=0 -v minp6=0 -v hosts=0 -f "$AWK_NET" >"$TMPD/canon"
+	while IFS=$'\t' read -r _ sc dc; do CANON[$dc]=$sc; done <"$TMPD/canon"
+	: >"$TMPD/flows"
+	for entry in "${BATCH[@]}"; do
+		read -r f sip proto sp dip dp <<<"$entry"
+		sc=${CANON[$sip]:-} dc=${CANON[$dip]:-}
+		[[ -n $sc && -n $dc ]] || continue
+		f6=0 s6=0 d6=0
+		[[ $f == 6 ]] && f6=1
+		[[ $sc == *:* ]] && s6=1
+		[[ $dc == *:* ]] && d6=1
+		((f6 == s6 && f6 == d6)) || continue # both addresses must belong to the announced family
+		if [[ -z ${ALLOWED["$f $sc"]+x} ]]; then
+			if set_test allow "$f" "$sc"; then ALLOWED["$f $sc"]=1; else ALLOWED["$f $sc"]=0; fi
+		fi
+		if [[ -z ${ALLOWED["$f $dc"]+x} ]]; then
+			if set_test allow "$f" "$dc"; then ALLOWED["$f $dc"]=1; else ALLOWED["$f $dc"]=0; fi
+		fi
+		[[ ${ALLOWED["$f $sc"]} == 0 && ${ALLOWED["$f $dc"]} == 0 ]] || continue
+		printf '%s %s %s %s %s %s\n' "$f" "$proto" "$sc" "$sp" "$dc" "$dp" >>"$TMPD/flows"
+		n=$((n + 1))
+	done
+	BATCH=()
+	((n > 0)) || return 0
+	ttl=$(dur2sec "${CFG[flow_ttl]}")
+	if flows_apply "$TMPD/flows" "$ttl"; then log_event "flows_added count=$n"; else log_event "flows_apply_failed count=$n"; fi
+	return 0
+}
+
+listener_apply() { # stdin: "fam src dst" lines from jq
+	local line rc last=$SECONDS
+	local -A SEEN=()
+	local -a BATCH=()
+	local CUR_MIN=0 MIN_COUNT=0 PAUSE_LOGGED=0
+	while true; do
+		IFS= read -r -t 3 line
+		rc=$?
+		if ((rc == 0)); then listener_line "$line"
+		elif ((rc <= 128)); then break; fi # EOF
+		if ((${#BATCH[@]} >= 500 || (${#BATCH[@]} > 0 && SECONDS - last >= 3))); then listener_flush; last=$SECONDS; fi
+	done
+	listener_flush
+}
+
+# Started by bb-listener@.service as user bb with stdin = the accepted socket.
+cmd___listener() {
+	export LC_ALL=C
+	have jq || { log_event "listener_error reason=no_jq"; exit 1; }
+	TMP_BASE=$LISTENER_DIR
+	CONF_FILE=$LISTENER_CONF
+	cfg_load || { log_event "listener_error reason=no_config"; exit 1; }
+	fw_select
+	listener_frames | jq -R -r --unbuffered "$LISTENER_JQ" | listener_apply
+}
+
+# Root side: the listener cannot read the notification secrets, so it leaves a note and the
+# guard raises the notification. Only an exact, known line format is honoured.
+listener_events_flush() {
+	local f=$LISTENER_DIR/events line seen=0
+	[[ -s $f ]] || return 0
+	while IFS= read -r line; do
+		[[ $line =~ ^rate_limit\ [0-9]{9,12}$ ]] && seen=1
+	done <"$f"
+	: >"$f"
+	((seen)) && log_event "rate_limit"
+	return 0
+}
+
+# ---- saving and showing dynamic flows -------------------------------------------------------------------
+# One line per element: "<backend>\t<set>\t<entry>\t<seconds left>", after a "# saved <epoch>" header.
+flows_dump() { # prints the live flow elements with their remaining seconds
+	local f s
+	if [[ $FW == ipt ]]; then
+		for f in $(fw_families); do
+			for s in flow_src flow_dst; do
+				ipset list "$(ipt_set "$s" "$f")" 2>/dev/null | awk -v s="$s$f" '
+					/^Members:/ { m = 1; next }
+					m && NF { t = ""; for (i = 2; i < NF; i++) if ($i == "timeout") t = $(i + 1)
+					          if (t != "") printf "ipt\t%s\t%s\t%d\n", s, $1, t }'
+			done
+		done
+	else
+		for f in $(fw_families); do
+			nft list set inet bb "flow$f" 2>/dev/null | awk -v s="flow$f" '
+				function secs(d,   t, n) { t = 0
+					while (match(d, /^[0-9]+(ms|d|h|m|s)/)) {
+						n = substr(d, 1, RLENGTH); d = substr(d, RLENGTH + 1)
+						if (n ~ /ms$/) continue
+						u = substr(n, length(n)); v = substr(n, 1, length(n) - 1) + 0
+						t += v * (u == "d" ? 86400 : u == "h" ? 3600 : u == "m" ? 60 : 1) }
+					return t }
+				/elements = \{/ { on = 1 }
+				on { txt = txt $0 }
+				on && /\}/ { on = 0 }
+				END { sub(/^[^{]*\{/, "", txt); sub(/\}[^}]*$/, "", txt); n = split(txt, e, ",")
+				      for (i = 1; i <= n; i++) { x = e[i]; gsub(/^[ \t]+|[ \t]+$/, "", x); if (x == "") continue
+				        entry = x; sub(/ timeout .*/, "", entry); sub(/ expires .*/, "", entry)
+				        left = x; if (match(left, /expires [0-9a-z]+/)) left = secs(substr(left, RSTART + 8, RLENGTH - 8)); else left = 0
+				        printf "nft\t%s\t%s\t%d\n", s, entry, left } }'
+		done
+	fi
+}
+
+cmd___save_flows() { # bb-firewall.service ExecStop
+	need_root; load_config require
+	mkdir -p -- "$STATE_DIR"
+	{ printf '# saved %s\n' "$(date +%s)"; flows_dump; } | write_atomic "$FLOWS_SAVE"
+}
+
+# Boot: the sets are new and empty, so put the saved flows back with what is left of their TTL.
+flows_restore_if_empty() {
+	local now saved
+	[[ -r $FLOWS_SAVE ]] || return 0
+	[[ -z $(flows_dump | head -1) ]] || return 0 # a live flow means this is not a boot
+	now=$(date +%s)
+	saved=$(sed -n 's/^# saved \([0-9]*\)$/\1/p' "$FLOWS_SAVE" | head -1)
+	[[ -n $saved ]] || return 0
+	mk_tmpdir
+	awk -F'\t' -v b="$FW" -v elapsed="$((now - saved))" '
+		$1 == b && $4 - elapsed > 0 { print $2 "\t" $3 "\t" $4 - elapsed }' "$FLOWS_SAVE" >"$TMPD/flows.restore"
+	[[ -s $TMPD/flows.restore ]] || return 0
+	if [[ $FW == ipt ]]; then
+		awk -F'\t' '{ print "add bb_" $1 " " $2 " timeout " $3 }' "$TMPD/flows.restore" | ipset restore -exist 2>/dev/null
+	else
+		awk -F'\t' '{ print "add element inet bb " $1 " { " $2 " timeout " $3 "s }" }' "$TMPD/flows.restore" | nft -f - 2>/dev/null
+	fi
+	return 0
+}
+
+cmd_show() {
+	local what=${1:-} kind fset entry left count=0
+	[[ $what == flows ]] || die err_usage show
+	need_root; load_config require
+	while IFS=$'\t' read -r kind fset entry left; do
+		((count++ == 0)) && say show_flows_head
+		say show_flow_line "$fset" "$entry" "$left"
+	done < <(flows_dump)
+	((count > 0)) || say show_flows_none
+}
+
+# ---- DPI: building nDPId, users, filter (tech.md section 11) -----------------------------------------------
+NDPID_REF=${NDPID_REF:-1.7} # a tag or a commit; pinned so that the build is reproducible
+NDPID_URL=${NDPID_URL:-https://github.com/utoni/nDPId.git}
+DPI_DEPS_APT="build-essential git cmake gettext flex bison libtool autoconf automake pkg-config libpcap-dev libjson-c-dev libnuma-dev libpcre2-dev libmaxminddb-dev librrd-dev"
+DPI_DEPS_DNF="gcc gcc-c++ make git cmake gettext flex bison libtool autoconf automake pkgconf-pkg-config libpcap-devel json-c-devel numactl-devel pcre2-devel libmaxminddb-devel rrdtool-devel"
+
+# The capture filter that the port mode implies ("all" means no filter).
+dpi_bpf_filter() {
+	local expr="" item
+	[[ ${CFG[ports_mode]} == all ]] && return 0
+	local IFS=,
+	for item in ${CFG[ports]}; do
+		if [[ $item == *-* ]]; then expr+="${expr:+ or }portrange $item"; else expr+="${expr:+ or }port $item"; fi
+	done
+	if [[ ${CFG[ports_mode]} == only ]]; then printf '(tcp or udp) and (%s)\n' "$expr"; else printf 'not (%s)\n' "$expr"; fi
+}
+
+# The option that takes the BPF filter, read from the help of the installed build (-B in 1.7).
+ndpid_bpf_flag() {
+	"$NDPID_BIN" -h 2>&1 | awk 'tolower($0) ~ /(bpf|pcap filter)/ && match($0, /^[[:space:]]*-[A-Za-z]/) {
+		f = substr($0, RSTART, RLENGTH); gsub(/[[:space:]]/, "", f); print f; exit }'
+}
+
+dpi_binary_ok() { [[ -x $NDPID_BIN ]] && "$NDPID_BIN" -h 2>&1 | grep -q 'nDPId'; }
+
+# Runs a command with a spinner and the percentage that cmake/make print; the log is kept for errors.
+run_step() { # label cmd args...
+	local label=$1 pid i=0 pct frames='|/-\'
+	shift
+	"$@" >>"$DPI_LOG" 2>&1 &
+	pid=$!
+	if [[ -t 1 ]]; then
+		while kill -0 "$pid" 2>/dev/null; do
+			pct=$(tail -c 3000 "$DPI_LOG" 2>/dev/null | grep -oE '\[ *[0-9]+%\]' | tail -1 | tr -dc '0-9')
+			printf '\r%s %s %s%%   ' "$label" "${frames:i++%4:1}" "${pct:-0}"
+			sleep 0.2
+		done
+		printf '\r%*s\r' 60 ''
+	fi
+	wait "$pid"
+}
+
+# D-007: only the libnDPI submodule is initialised. A recursive clone also fetches example
+# submodules that are never built (and live on a second host).
+dpi_build() {
+	local src before
+	if [[ ${BB_TESTING:-} == 1 && -n ${BB_FAKE_NDPID:-} ]]; then
+		install -D -m 0755 "$BB_FAKE_NDPID" "$NDPID_BIN" || return 1
+		return 0
+	fi
+	mkdir -p -- "$STATE_DIR"
+	: >"$DPI_LOG"
+	if [[ ${BB_SKIP_BUILD_DEPS:-} != 1 ]]; then
+		before=$(pkgs_snapshot)
+		local deps=$DPI_DEPS_APT
+		[[ $OS_FAMILY == dnf ]] && deps=$DPI_DEPS_DNF
+		# shellcheck disable=SC2086
+		run_step "$(t dpi_step_deps)" pkg_install "$OS_FAMILY" $deps || { pkgs_record_new "$before"; return 1; }
+		pkgs_record_new "$before"
+	fi
+	mk_tmpdir
+	src=$TMPD/ndpid
+	if [[ $NDPID_REF =~ ^[0-9a-f]{7,40}$ ]]; then
+		run_step "$(t dpi_step_build)" git clone "$NDPID_URL" "$src" && git -C "$src" checkout -q "$NDPID_REF" || return 1
+	else
+		run_step "$(t dpi_step_build)" git clone --depth 1 --branch "$NDPID_REF" "$NDPID_URL" "$src" || return 1
+	fi
+	run_step "$(t dpi_step_build)" git -C "$src" submodule update --init --depth 1 libnDPI ||
+		run_step "$(t dpi_step_build)" git -C "$src" submodule update --init libnDPI || return 1
+	mkdir -p -- "$src/build"
+	run_step "$(t dpi_step_build)" cmake -S "$src" -B "$src/build" -DBUILD_NDPI=ON -DBUILD_EXAMPLES=OFF || return 1
+	run_step "$(t dpi_step_build)" make -C "$src/build" -j"$(nproc)" || return 1
+	[[ -x $src/build/nDPId ]] || return 1
+	install -D -m 0755 "$src/build/nDPId" "$NDPID_BIN" || return 1
+	printf '%s %s\n' "$NDPID_REF" "$(git -C "$src" rev-parse HEAD 2>/dev/null)" >"$STATE_DIR/ndpid.version"
+	say dpi_built "$NDPID_REF" "$NDPID_BIN"
+}
+
+dpi_create_users() {
+	local u nologin
+	nologin=$(command -v nologin 2>/dev/null || printf '/usr/sbin/nologin')
+	for u in bb bb-ndpid; do
+		if ! getent passwd "$u" >/dev/null 2>&1; then
+			useradd --system --user-group --no-create-home --home-dir /nonexistent --shell "$nologin" "$u" || { err err_dpi_user "$u"; return 1; }
+			manifest_add user "$u"
+		fi
+	done
+}
+
+# D-009: the listener runs as the unprivileged user bb and cannot read /etc/bb, so it gets a copy of
+# the few settings it needs, and a directory of its own to write to.
+listener_conf_write() {
+	local k
+	mkdir -p -- "$STATE_DIR"
+	chmod 0755 "$STATE_DIR"
+	install -d -m 0700 "$LISTENER_DIR"
+	{
+		printf '# generated by bb from bb.conf; read by the listener\n' # bb-lint: ok
+		for k in backend ipv6 flow_ttl flow_dedup flow_rate_limit max_event_size; do printf "%s='%s'\n" "$k" "${CFG[$k]}"; done
+	} | write_atomic "$LISTENER_CONF"
+	if getent group bb >/dev/null 2>&1; then
+		chgrp bb "$LISTENER_CONF" && chmod 0640 "$LISTENER_CONF"
+		chown bb:bb "$LISTENER_DIR"
+	else
+		chmod 0644 "$LISTENER_CONF"
+	fi
+}
+
 # ---- install / uninstall -------------------------------------------------------
 OS_FAMILY="" OS_ID=""
 PLAN_BACKEND="" PLAN_PKGS=""
-UNIT_NAMES="bb-sets.service bb-firewall.service bb-update.service bb-update.timer bb-guard.service bb-guard.timer bb-digest.service bb-digest.timer bb-notify-failure@.service"
+UNIT_NAMES="bb-sets.service bb-firewall.service bb-update.service bb-update.timer bb-guard.service bb-guard.timer bb-digest.service bb-digest.timer bb-notify-failure@.service bb-listener.socket bb-listener@.service bb-ndpid.service"
 
 os_info() { # sets OS_FAMILY (apt|dnf|unknown) and OS_ID
 	local line id="" like="" tok
@@ -2471,7 +2845,16 @@ ReadWritePaths=-/etc/bb -/var/lib/bb -/var/backups/bb /run
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_DAC_OVERRIDE CAP_FOWNER CAP_CHOWN'
 
 unit_text() { # name
-	local bin=$BIN_PATH wants="" guard onfail="OnFailure=bb-notify-failure@%n.service"
+	local bin=$BIN_PATH wants="" guard onfail="OnFailure=bb-notify-failure@%n.service" ndpid flag filter
+	# D-010: verified on nDPId 1.7: started as an unprivileged user it tries to switch to "nobody" and
+	# exits unless -u/-g name its own user; it opens one collector connection per reader thread
+	# (10 by default), so the threads are capped to fit the socket's connection limit.
+	ndpid="$NDPID_BIN -i ${CFG[iface]:-lo} -c /run/bb/ndpid.sock -u bb-ndpid -g bb-ndpid -a bb -o max-reader-threads=4"
+	filter=$(dpi_bpf_filter)
+	if [[ -n $filter ]]; then
+		flag=$(ndpid_bpf_flag 2>/dev/null)
+		[[ -n $flag ]] && ndpid+=" $flag \"$filter\""
+	fi
 	guard=$(dur2sec "${CFG[guard_interval]}")
 	[[ ${CFG[backend]} == iptables ]] && wants="Wants=bb-sets.service"
 	case $1 in
@@ -2507,6 +2890,7 @@ $wants
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=$bin apply
+ExecStop=$bin __save-flows
 $HARDEN
 
 [Install]
@@ -2604,6 +2988,73 @@ ExecStart=$bin __notify-event service_failed unit=%i
 $HARDEN
 EOF
 			;;
+		bb-listener.socket) # D-008: the socket belongs to the nDPId user, not to root
+			cat <<EOF
+[Unit]
+Description=bb: socket for the nDPId event stream
+
+[Socket]
+ListenStream=/run/bb/ndpid.sock
+SocketUser=bb-ndpid
+SocketGroup=bb-ndpid
+SocketMode=0600
+DirectoryMode=0755
+Accept=yes
+MaxConnections=8
+
+[Install]
+WantedBy=sockets.target
+EOF
+			;;
+		bb-listener@.service)
+			cat <<EOF
+[Unit]
+Description=bb: listener for BitTorrent flows
+After=bb-firewall.service
+Wants=bb-firewall.service
+
+[Service]
+User=bb
+Group=bb
+StandardInput=socket
+StandardOutput=journal
+StandardError=journal
+ExecStart=$bin __listener
+NoNewPrivileges=yes
+ProtectHome=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=-/var/lib/bb/listener
+AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+EOF
+			;;
+		bb-ndpid.service)
+			cat <<EOF
+[Unit]
+Description=bb: nDPId traffic inspection
+$onfail
+Requires=bb-listener.socket
+After=bb-listener.socket bb-firewall.service network.target
+
+[Service]
+User=bb-ndpid
+Group=bb-ndpid
+ExecStart=$ndpid
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+ProtectHome=yes
+PrivateTmp=yes
+ProtectSystem=strict
+AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN
+
+[Install]
+WantedBy=multi-user.target
+EOF
+			;;
 		*) return 1 ;;
 	esac | awk 'NF || prev { print } { prev = NF }' # drop the blank line an empty $wants leaves
 }
@@ -2612,15 +3063,18 @@ units_install() {
 	local u tmp
 	mkdir -p -- "$UNIT_DIR" || return 1
 	for u in $UNIT_NAMES; do
-		[[ $u == bb-sets.service && ${CFG[backend]} != iptables ]] && continue
+		case $u in
+			bb-sets.service) [[ ${CFG[backend]} == iptables ]] || { rm -f -- "$UNIT_DIR/$u"; continue; } ;;
+			bb-listener.socket | bb-listener@.service | bb-ndpid.service) [[ ${CFG[dpi]} == yes ]] || { rm -f -- "$UNIT_DIR/$u"; continue; } ;;
+		esac
 		tmp=$UNIT_DIR/$u.new
 		unit_text "$u" >"$tmp" && chmod 0644 "$tmp" && mv -f -- "$tmp" "$UNIT_DIR/$u" || return 1
 	done
-	[[ ${CFG[backend]} == iptables ]] || rm -f -- "$UNIT_DIR/bb-sets.service"
 	systemctl daemon-reload >/dev/null 2>&1 || true
 	digest_timer_sync
 	systemctl enable bb-firewall.service bb-update.timer bb-guard.timer >/dev/null 2>&1 || return 1
 	[[ ${CFG[backend]} == iptables ]] && { systemctl enable bb-sets.service >/dev/null 2>&1 || return 1; }
+	if [[ ${CFG[dpi]} == yes ]]; then systemctl enable bb-listener.socket bb-ndpid.service >/dev/null 2>&1 || return 1; fi
 	return 0
 }
 
@@ -2642,6 +3096,14 @@ selfcheck() {
 		systemctl is-enabled --quiet "$u" 2>/dev/null || { t chk_unit_disabled "$u"; printf '\n'; }
 	done
 	[[ ${CFG[backend]} == iptables ]] && { systemctl is-enabled --quiet bb-sets.service 2>/dev/null || { t chk_unit_disabled bb-sets.service; printf '\n'; }; }
+	if [[ ${CFG[dpi]} == yes ]]; then
+		dpi_binary_ok || { t chk_dpi_bin; printf '\n'; }
+		for u in bb bb-ndpid; do getent passwd "$u" >/dev/null 2>&1 || { t chk_dpi_user "$u"; printf '\n'; }; done
+		[[ -s $LISTENER_CONF ]] || { t chk_dpi_conf; printf '\n'; }
+		for u in bb-listener.socket bb-ndpid.service; do
+			systemctl is-enabled --quiet "$u" 2>/dev/null || { t chk_unit_disabled "$u"; printf '\n'; }
+		done
+	fi
 	return 0
 }
 
@@ -2672,7 +3134,7 @@ install_choose_lang() { # $1 = interactive (0/1)
 }
 
 cmd_install() {
-	local want="" iface="" pmode="" ports="" yes=0 force=0 nodpi=0 inter=0 def
+	local want="" iface="" pmode="" ports="" yes=0 force=0 nodpi=0 inter=0 def dpi=1 ans
 	while (($#)); do
 		case $1 in
 			--backend) want=${2:-}; (($# >= 2)) || die err_usage install; shift 2 ;;
@@ -2707,6 +3169,12 @@ cmd_install() {
 
 	# 2. plan, then packages (nothing on the system has changed up to here)
 	plan_install "$want"
+	((nodpi)) && dpi=0
+	if ((dpi == 1 && inter == 1)); then
+		ans=$(ask "$(t inst_prompt_dpi) " Y)
+		[[ ${ans,,} == n* ]] && dpi=0
+	fi
+	if ((dpi)) && ! have jq; then PLAN_PKGS=$(printf '%s\n' $PLAN_PKGS jq | awk 'NF && !seen[$0]++' | tr '\n' ' '); PLAN_PKGS=${PLAN_PKGS% }; fi
 	if [[ -n $PLAN_PKGS ]]; then
 		say inst_plan_pkgs "$PLAN_BACKEND" "$PLAN_PKGS"
 		[[ $OS_FAMILY != unknown ]] || die err_os_unsupported "${OS_ID:-?}" "$PLAN_PKGS"
@@ -2741,6 +3209,20 @@ cmd_install() {
 	cfg_valid ports_mode "$pmode" || die err_cfg_invalid ports_mode "$pmode"
 	if [[ $pmode != all ]]; then ports_valid "$ports" || die err_cfg_invalid ports "$ports"; else ports=""; fi
 
+	# 3b. traffic inspection: build nDPId first; the firewall is not touched until this has succeeded
+	local bpf="" bflag=""
+	CFG[ports_mode]=$pmode CFG[ports]=$ports
+	if ((dpi)); then
+		if dpi_binary_ok; then say dpi_present; else
+			dpi_build || { err err_dpi_build "$DPI_LOG"; exit 1; }
+		fi
+		bpf=$(dpi_bpf_filter)
+		if [[ -n $bpf ]]; then
+			bflag=$(ndpid_bpf_flag)
+			[[ -n $bflag ]] || die err_dpi_flag
+		fi
+	fi
+
 	# 4. backup, configuration, allowlist, sets and rules (monitor mode)
 	local bdir
 	bdir=$(install_backup)
@@ -2748,7 +3230,7 @@ cmd_install() {
 	CFG[backend]=$PLAN_BACKEND
 	CFG[iface]=$iface CFG[ports_mode]=$pmode CFG[ports]=$ports
 	CFG[mode]=monitor
-	((nodpi)) && CFG[dpi]=no
+	if ((dpi)); then CFG[dpi]=yes; else CFG[dpi]=no; fi
 	if [[ -s /proc/net/if_inet6 ]]; then CFG[ipv6]=yes; else CFG[ipv6]=no; fi
 	[[ -n ${BB_FORCE_IPV6:-} && ${BB_TESTING:-} == 1 ]] && CFG[ipv6]=$BB_FORCE_IPV6
 	mkdir -p -- "$LISTS_D" "$STATE_DIR" "$BACKUP_DIR" || die err_mkdir "$CONF_DIR"
@@ -2767,7 +3249,13 @@ cmd_install() {
 		say inst_backup_kept "$bdir"
 		exit 1
 	fi
-	((nodpi)) || say inst_dpi_later
+	if ((dpi)); then
+		dpi_create_users || { say inst_backup_kept "$bdir"; exit 1; }
+		listener_conf_write
+		say inst_dpi_on "$NDPID_REF" "${bpf:-$(t word_none)}"
+	else
+		say inst_dpi_off
+	fi
 
 	# 5. units
 	if have_systemd; then
@@ -2794,6 +3282,7 @@ cmd_install() {
 	exec 9>&-
 	if have_systemd; then
 		systemctl start bb-firewall.service bb-update.timer bb-guard.timer >/dev/null 2>&1 || warn warn_units_start
+		((dpi)) && { systemctl start bb-listener.socket bb-ndpid.service >/dev/null 2>&1 || warn warn_units_start; }
 	fi
 	say inst_done
 }
@@ -2872,6 +3361,7 @@ cmd_uninstall() {
 		done <"$MANIFEST"
 	fi
 	NOTIFY_SYNC=1 log_event "uninstall"
+	systemctl stop 'bb-listener@*.service' >/dev/null 2>&1
 	for u in $UNIT_NAMES bb-mode-rollback.timer; do
 		systemctl stop "$u" >/dev/null 2>&1
 		systemctl disable "$u" >/dev/null 2>&1
@@ -2957,6 +3447,9 @@ main() {
 		__unit) cmd___unit "$@" ;;
 		notify) cmd_notify "$@" ;;
 		integrate) cmd_integrate "$@" ;;
+		show) cmd_show "$@" ;;
+		__listener) cmd___listener "$@" ;;
+		__save-flows) cmd___save_flows "$@" ;;
 		doctor) cmd_doctor "$@" ;;
 		__notify-flush) cmd___notify_flush "$@" ;;
 		__notify-event) cmd___notify_event "$@" ;;

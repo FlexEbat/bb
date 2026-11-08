@@ -58,7 +58,7 @@ sudo bb notify test
 ```
 bb install [--lang en|ru] [--backend iptables|nft] [--iface IFACE] [--ports-mode only|all|except]
            [--ports LIST] [--no-dpi] [--yes] [--force]
-bb status                     bb doctor
+bb status                     bb doctor                     bb show flows
 bb apply                      bb guard
 bb lang [en|ru]               show or change the interface language
 bb list [add|update|rm]       bb ban <ip|net> [--ttl 7d]    bb unban <ip|net>
@@ -95,7 +95,8 @@ packages alone). Rules of other tools are never touched, and the whole ruleset i
 ## Development
 
 ```sh
-sudo make test        # shellcheck + catalog lint + bats suite (needs root, uses network namespaces)
+sudo make test        # shellcheck + catalog lint + spec check + bats suite (needs root, uses network namespaces)
+sudo BB_REAL_NDPID=/path/to/nDPId make test   # also runs the live-capture tests with a built nDPId (needs socat)
 ```
 
 The suite runs in a private network and mount namespace and exercises both backends with

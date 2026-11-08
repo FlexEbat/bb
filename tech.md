@@ -147,9 +147,9 @@ Important: "pass" only means "do not apply `bb` blocking". The rules of ufw, fir
 
 The protocol details below are re-verified whenever the nDPId version changes.
 
-- **Connection.** nDPId is started with `-c <path to a unix socket>` and connects by itself to the socket that the listener serves. The intermediate nDPIsrvd daemon is not needed. The interface is set with `-i`; the capture BPF filter uses a separate flag whose name differs between versions and is detected from the `nDPId -h` help output (section 11).
-- **Framing.** Each message is 5 decimal digits of length followed by JSON. The length is validated (limit `max_event_size`, 1 MiB by default); on an invalid header the connection is closed and nDPId reconnects.
-- **Socket without `socat` or `nc`.** The `bb-listener.socket` unit (systemd socket activation: `ListenStream=/run/bb/ndpid.sock`, `Accept=yes`, `SocketMode=0600`, `MaxConnections=4`) starts a `bb-listener@.service` instance for each connection, whose stdin and stdout are the socket itself (`StandardInput=socket`). Bash does not have to open the socket, the socket is available immediately, and nDPId can be started in any order.
+- **Connection.** nDPId is started with `-c <path to a unix socket>` and connects by itself to the socket that the listener serves. The intermediate nDPIsrvd daemon is not needed. The interface is set with `-i`; the capture BPF filter uses a separate flag whose name differs between versions and is detected from the `nDPId -h` help output (section 11). Verified on nDPId 1.7: the capture-filter flag is `-B`; started as an unprivileged user nDPId tries to switch to `nobody` and exits unless `-u` and `-g` name its own user; and it opens one collector connection per reader thread (10 by default), so the unit sets `-o max-reader-threads=4` (see D-010).
+- **Framing.** Each message is 5 decimal digits of length followed by JSON. The length is validated (limit `max_event_size`, 1 MiB by default); on an invalid header the connection is closed and nDPId reconnects. Verified on nDPId 1.7: the length counts the JSON's trailing newline, and a recorded stream is kept as the test fixture `tests/fixtures/ndpid-1.7.raw`.
+- **Socket without `socat` or `nc`.** The `bb-listener.socket` unit (systemd socket activation: `ListenStream=/run/bb/ndpid.sock`, `Accept=yes`, `SocketUser=bb-ndpid` (see D-008), `SocketMode=0600`, `MaxConnections=8` (see D-010)) starts a `bb-listener@.service` instance for each connection, whose stdin and stdout are the socket itself (`StandardInput=socket`). Bash does not have to open the socket, the socket is available immediately, and nDPId can be started in any order.
 - **Frame parsing.** Bash with `LC_ALL=C` (so that character counting matches bytes) reads `read -N 5`, then `read -N <length>`, and passes clean JSON objects to a single long-lived `jq --unbuffered -c` process (the pipeline "frame parsing → `jq` → apply").
 - **`jq` filter.** Events whose `flow_event_name` is `detected` or `detection-update` are taken. The `guessed` event, where the protocol was determined by port, is ignored as unreliable. Conditions: the `ndpi.proto` field contains `bittorrent` (case-insensitive), `l4_proto` is `tcp` or `udp`, `src_ip` and `dst_ip` are of the same family, ports are 1–65535. The output is compact lines "family, source, destination" with elements of the form `address,protocol:port`.
 - **Validation twice:** in `jq` (IPv4/IPv6 patterns, port range) and once more in bash before applying. Other strings from events (SNI, host names, etc.) are untrusted and are never substituted into commands.
@@ -157,6 +157,7 @@ The protocol details below are re-verified whenever the nDPId version changes.
 - **Deduplication:** an associative array "flow → time until which repeated events are ignored" (`flow_dedup`, 600 s by default). After the window the entry is refreshed and the TTL extended. The array size is capped (100,000 entries); when full it is cleared, so memory does not grow.
 - **Protection:** addresses from the allowlist and private ranges never enter `flow`; the number of new entries per minute is limited (`flow_rate_limit`); when exceeded, the listener pauses and sends a `rate_limit` notification.
 - **Resilience:** corrupted, truncated and oversized messages are skipped or close the connection (see above), nDPId reconnects, and `bb-listener.socket` stays active.
+- **Privileges.** The listener runs as the unprivileged user `bb` with only `CAP_NET_ADMIN`. It cannot read `/etc/bb`: it gets a copy of the few settings it needs in `/var/lib/bb/listener.conf`, writes only to `/var/lib/bb/listener/`, reads the allowlist from the live kernel set, and leaves `rate_limit` notes that the guard turns into notifications (see D-009).
 - **Why `jq`:** it is a real parser from the standard repositories, one small package, installed only when needed. A home-grown awk parser (hard to maintain, mawk vs gawk differences) and a separate Go or C binary (building and distributing for different architectures contradicts the "bash and repository packages" goal) were considered and rejected.
 
 ## 7. Lists
@@ -345,7 +346,7 @@ Installation: `apt-get install -y <packages>` and `dnf install -y <packages>`. I
 
 ### nDPId: building
 
-- nDPId is not in the standard repositories, so it is built from source: `git clone --recursive`, `cmake -DBUILD_NDPI=ON -DBUILD_EXAMPLES=OFF`, `make -j"$(nproc)"`. The binary is copied to `/usr/local/bin/bb-ndpid` and the build directory is removed.
+- nDPId is not in the standard repositories, so it is built from source: `git clone --depth 1 --branch $NDPID_REF` and `git submodule update --init --depth 1 libnDPI` (see D-007), `cmake -DBUILD_NDPI=ON -DBUILD_EXAMPLES=OFF`, `make -j"$(nproc)"`. The binary is copied to `/usr/local/bin/bb-ndpid` and the build directory is removed.
 - The version is pinned with the `NDPID_REF` variable (tag or commit). After the build the built commit is printed together with a hint on how to pin it.
 - If a ready binary already exists and runs (`-h` responds, no library loading errors), the build is skipped.
 - Build packages are installed only when DPI is enabled. apt: `build-essential git cmake gettext flex bison libtool autoconf automake pkg-config libpcap-dev libjson-c-dev libnuma-dev libpcre2-dev libmaxminddb-dev librrd-dev`. dnf: `gcc gcc-c++ make git cmake gettext flex bison libtool autoconf automake pkgconf-pkg-config libpcap-devel json-c-devel numactl-devel pcre2-devel libmaxminddb-devel rrdtool-devel` (the dnf list is refined by testing). They are recorded in the manifest (section 10), so `bb uninstall` removes the ones that `bb` itself installed, unless something else depends on them.
@@ -399,7 +400,7 @@ Logging: through journald, `bb` events carry the tag `bb` (`journalctl -t bb`), 
 - **locking against parallel runs:** all state-changing commands run under `flock /run/bb.lock` (waiting up to 30 seconds) so that timers and manual commands do not change the rules at the same time;
 - **safe list downloads:** HTTPS only (including redirects), timeouts and retries, a file size limit, strict validation of every line; list contents are treated as untrusted and never executed; an optional `sha256=` in the list description;
 - **privileges and isolation:** the listener does not run as root (user `bb`), nDPId runs as a separate user; units use `NoNewPrivileges=yes`, `ProtectSystem=strict`, `ProtectHome=yes`, `PrivateTmp=yes`, minimal capabilities (`CAP_NET_ADMIN` for firewall work, `CAP_NET_RAW` for capture in nDPId), `ReadWritePaths` only for `/var/lib/bb`;
-- the nDPId socket is accessible to root only (`SocketMode=0600`);
+- the nDPId socket is accessible only to the nDPId user and root (`SocketUser=bb-ndpid`, `SocketMode=0600`, see D-008);
 - `bb uninstall` removes everything `bb` installed or configured (section 10), including the packages it added unless other software depends on them; if the saved rule files referenced `bb` objects, they are re-saved without those references;
 - **notification secrets:** tokens only in `/etc/bb/notify.conf` (0600), not in the journal and not in the process list (section 9);
 - **SELinux** (dnf systems): operation is verified in enforcing mode, AVC denials are shown in `bb doctor`.
@@ -479,7 +480,7 @@ The work is split into vertical slices, done in order. A slice is closed when ev
 | S4 | Installation and operation | partial | 15/16 |
 | S5 | Notifications | partial | 11/12 |
 | S6 | Integrations and diagnostics | partial | 8/9 |
-| S7 | Dynamic layer (nDPId and the listener) | remaining | 0/14 |
+| S7 | Dynamic layer (nDPId and the listener) | partial | 17/20 |
 | S8 | Machine-readable output and logs | remaining | 0/3 |
 | S9 | Test matrix and CI | remaining | 0/7 |
 | S10 | Documentation and release | partial | 2/4 |
@@ -645,28 +646,34 @@ The work is split into vertical slices, done in order. A slice is closed when ev
 
 ### Slice 7: Dynamic layer (nDPId and the listener)
 
-**Files:** `src/bb`, `tests/dpi.bats`, `tests/fixtures/`.
+**Files:** `src/bb`, `tests/dpi.bats`, `tests/dpi_install.bats`, `tests/e2e.bats`, `tests/fixtures/`.
 
-**What it does:** builds nDPId from a pinned reference, the listener (bash and `jq`) behind a socket unit, dynamic flows in `flow` sets, `bb show flows`.
+**What it does:** builds nDPId from a pinned reference, the listener (bash and `jq`) behind a socket unit, dynamic flows in `flow` sets that survive a restart, `bb show flows`.
 
 **Acceptance criteria:**
 
-1. [ ] **S7.1** nDPId is built from a pinned reference and installed as `bb-ndpid`.
-2. [ ] **S7.2** The BPF flag is detected from `-h`; the port mode produces the capture filter.
-3. [ ] **S7.3** The listener parses frames of the real nDPId stream and survives invalid, truncated and oversized frames.
-4. [ ] **S7.4** Only `detected` and `detection-update` BitTorrent events become flows.
-5. [ ] **S7.5** Hostile or malformed fields never reach a command.
-6. [ ] **S7.6** Private and allowlisted addresses never enter `flow`.
-7. [ ] **S7.7** Repeated events are deduplicated and memory stays bounded.
-8. [ ] **S7.8** Exceeding the rate limit pauses the listener and raises `rate_limit`.
-9. [ ] **S7.9** Flows block by tuple on both backends.
-10. [ ] **S7.10** The listener runs without root, with only `CAP_NET_ADMIN`.
-11. [ ] **S7.11** Dynamic flows survive a restart.
-12. [ ] **S7.12** `bb show flows` lists them.
-13. [ ] **S7.13** A live capture through the real nDPId ends in a blocked flow.
-14. [ ] **S7.14** `bb uninstall` removes everything of the dynamic layer.
+1. [x] **S7.1** nDPId is built from a pinned reference (a tag or a commit) with only the `libnDPI` submodule initialised (see D-007), installed as `bb-ndpid`, not built again when it is there, and a failed build changes nothing and says how to go on. (tests/dpi_install.bats: the build clones the pinned tag and initialises only libnDPI) (tests/dpi_install.bats: an installed nDPId is not built again) (tests/dpi_install.bats: a failed build leaves the firewall, the configuration and the users untouched)
+2. [x] **S7.2** The capture-filter option is read from the help of the installed build, the port mode produces the filter, and a build without that option stops the install before anything changes. (tests/dpi_install.bats: the port mode becomes the capture filter, using the option found in the help of the build) (tests/dpi_install.bats: a build without a capture-filter option stops the install before anything changes)
+3. [x] **S7.3** The listener understands the stream of the real nDPId 1.7, whose frame length includes the trailing newline. (tests/dpi.bats: the real nDPId 1.7 stream yields the BitTorrent flows)
+4. [x] **S7.4** Invalid, truncated and oversized frames end the connection safely, and corrupt JSON lines are skipped. (tests/dpi.bats: invalid, truncated and oversized frames end the connection safely) (tests/dpi.bats: corrupt JSON lines are skipped and the stream goes on)
+5. [x] **S7.5** Only `detected` and `detection-update` events of BitTorrent become flows. (tests/dpi.bats: only detected and detection-update BitTorrent events become flows)
+6. [x] **S7.6** Hostile or malformed fields never reach a command. (tests/dpi.bats: hostile or malformed fields never reach a command)
+7. [x] **S7.7** Private, special and allowlisted addresses never enter `flow`, on the source side and on the destination side. (tests/dpi.bats: private, special and allowlisted addresses never enter flow)
+8. [x] **S7.8** Repeated events are deduplicated. (tests/dpi.bats: repeated events are deduplicated)
+9. [~] **S7.9** The deduplication memory is bounded (cleared at 100,000 entries). The cap is in the code but has not been stress-tested.
+10. [x] **S7.10** Exceeding the rate limit pauses the listener, and the guard turns its note into a `rate_limit` event; anything but the exact note format is ignored (see D-009). (tests/dpi.bats: exceeding the rate limit pauses the listener and raises rate_limit once)
+11. [x] **S7.11** Flows block by the full tuple, not by host, on both backends. (tests/backend.bats: flow: blocks by full tuple, not by host)
+12. [x] **S7.12** The listener runs as an unprivileged user with `CAP_NET_ADMIN` and nothing else, nDPId runs as its own user, and the socket belongs to that user (see D-008, D-010, D-009). (tests/dpi_install.bats: the listener runs as an unprivileged user with CAP_NET_ADMIN and nothing else) (tests/dpi_install.bats: units: the socket belongs to the nDPId user)
+13. [x] **S7.13** Dynamic flows survive a restart with what is left of their TTL, and expired ones are not restored. (tests/dpi.bats: dynamic flows survive a restart with what is left of their TTL) (tests/dpi.bats: a flow whose TTL ran out while the host was down is not restored)
+14. [x] **S7.14** `bb show flows` lists the flows, says when there are none, and is localized. (tests/dpi.bats: bb show flows lists the flows, says when there are none, and is localized)
+15. [x] **S7.15** A live capture through the real nDPId ends in a blocked connection, and ordinary traffic produces no flow. Verified against nDPId 1.7 on both backends; these tests skip themselves unless `BB_REAL_NDPID` names a built nDPId. (tests/e2e.bats: a live BitTorrent connection is detected, its flow is added and the connection is cut) (tests/e2e.bats: ordinary traffic produces no flow)
+16. [x] **S7.16** `--no-dpi` gives the static mode without units, users or binary; the build packages are recorded; the new units are valid for `systemd-analyze`. (tests/dpi_install.bats: --no-dpi: static mode) (tests/dpi_install.bats: build packages are installed and recorded) (tests/dpi_install.bats: units: syntax and ordering of the dynamic-layer units are valid for systemd-analyze)
+17. [x] **S7.17** `bb uninstall` removes the whole dynamic layer, and a user that was already there stays. (tests/dpi_install.bats: uninstall removes the dynamic layer)
+18. [x] **S7.18** `bb doctor` checks the binary, `jq`, the users, the units and the listener configuration. (tests/dpi_install.bats: bb doctor checks the dynamic layer)
+19. [~] **S7.19** A progress indicator with the percentage is shown while building. The code is there, but output on a terminal is not tested.
+20. [~] **S7.20** The socket and the units start under a real systemd. They are only checked with `systemd-analyze` and `socat` as a stand-in for socket activation here; covered by slice 9.
 
-**Tests:** `tests/dpi.bats`, `tests/fixtures/ndpid-1.7.raw` (a stream recorded from the real nDPId).
+**Tests:** `tests/dpi.bats` (listener, against the stream recorded from the real nDPId), `tests/dpi_install.bats`, `tests/e2e.bats` (live capture), `tests/fixtures/ndpid-1.7.raw`.
 
 **Not to do:** Python, the nDPIsrvd daemon, parsing JSON in bash or `awk`.
 
@@ -750,3 +757,7 @@ A deviation is a place where the implementation deliberately does something othe
 | D-004 | §10 | Additions to the CLI: `bb allow <net> --rm`, `bb list` without arguments (shows the lists), `bb notify events [LIST]`, `bb integrate none` and `bb integrate <name>`, `bb uninstall --keep-packages`, and internal commands starting with `__` that units and tests call. | Without them the allowlist could not shrink, the lists could not be inspected, and the units had nothing to call. | active | (tests/cli.bats: ban/unban/allow edit the source files; ban is idempotent) (tests/integrations.bats: bb integrate: selection, none, auto, errors and status) (tests/install.bats: uninstall --keep-packages leaves packages alone) |
 | D-005 | §6.1, §7 | Entries broader than /8 (IPv4) or /16 (IPv6) are rejected in lists and in manual bans and allowlist entries. | One bad line such as `0.0.0.0/0` must not be able to block everything. | active | (tests/cli.bats: norm: invalid and too-broad entries are rejected) |
 | D-006 | §10, §13 | An unconfirmed `block` mode is also reverted after a reboot: a marker is kept while the rollback timer runs, and `apply` and `guard` revert the mode when the timer is gone. | The rollback timer is transient and does not survive a reboot, so a host rebooted inside the confirmation window would stay in an unconfirmed `block`. | active | (tests/install.bats: an unconfirmed block mode is reverted by apply/guard when the timer is gone) |
+| D-007 | §11 | nDPId is cloned with `git clone --depth 1 --branch <ref>` (a full clone and a checkout when the reference is a commit) and only the `libnDPI` submodule is initialised, instead of `git clone --recursive`. | The other submodules are examples that are never built (`BUILD_EXAMPLES=OFF`) and are hosted on a second server, which makes the build fail on restricted networks. | active | (tests/dpi_install.bats: the build clones the pinned tag and initialises only libnDPI) |
+| D-008 | §6.4, §13 | The socket of `bb-listener.socket` belongs to the nDPId user (`SocketUser=bb-ndpid`, mode 0600) and not to root. | The text asks for nDPId to run as a separate user and for a socket that only root can use, which would keep nDPId from connecting. | active | (tests/dpi_install.bats: units: the socket belongs to the nDPId user) |
+| D-009 | §6.4, §13 | The listener (user `bb`) reads a root-written copy of its settings from `/var/lib/bb/listener.conf`, writes only to `/var/lib/bb/listener/`, reads the allowlist from the live kernel set, and leaves `rate_limit` notes that the guard turns into notifications (so such a notification can be up to `guard_interval` late). | `bb.conf` and `notify.conf` are root-only, so an unprivileged listener cannot read them or send notifications itself, and a narrower writable path than `/var/lib/bb` keeps it from touching root's files. | active | (tests/dpi_install.bats: the listener runs as an unprivileged user with CAP_NET_ADMIN and nothing else) (tests/dpi.bats: exceeding the rate limit pauses the listener and raises rate_limit once) |
+| D-010 | §6.4 | nDPId is started with `-u bb-ndpid -g bb-ndpid -a bb -o max-reader-threads=4`, and the socket accepts 8 connections instead of 4. | Verified on nDPId 1.7: started as an unprivileged user it tries to switch to `nobody` and exits unless `-u` and `-g` name its own user, and it opens one collector connection per reader thread (10 by default), so a limit of 4 would turn most of them away. | active | (tests/dpi_install.bats: units: the socket belongs to the nDPId user) (tests/e2e.bats: a live BitTorrent connection is detected) |

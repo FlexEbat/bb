@@ -333,7 +333,7 @@ STUB
 	mkdir -p "$R/units"; export BB_UNIT_DIR=$R/units
 	setup_tg >/dev/null
 	events install,uninstall
-	bb install --backend nft --yes --iface lo >/dev/null
+	bb install --no-dpi --backend nft --yes --iface lo >/dev/null
 	grep -q 'install: bb installed, backend nft' "$R/curl.cfg"
 	unset BB_NOTIFY_SYNC
 	bb uninstall --yes >/dev/null
