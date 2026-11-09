@@ -126,3 +126,50 @@ STUB
 	run bb __unit 'bb-listener@.service'
 	[[ $output == *"MemoryMax="* ]]
 }
+
+# R8: dynamic flows block the real tuple on both backends 
+udp_from() { # sport dport: does a datagram from 198.51.100.1:sport reach the peer's dport?
+	: >"$R/udp.out"
+	ip netns exec bbpeer sh -c "timeout 4 nc -u -l $2 >'$R/udp.out'" &
+	local pid=$!
+	sleep 0.5
+	printf 'hello\n' | timeout 3 nc -u -w1 -p "$1" 198.51.100.2 "$2" 2>/dev/null
+	sleep 0.4; kill "$pid" 2>/dev/null; pkill -f "nc -u -l" 2>/dev/null; wait "$pid" 2>/dev/null || true
+	[ -s "$R/udp.out" ]
+}
+
+t_flow_tuple() {
+	topo_up
+	bb __init-config --backend "$1" --ipv6 no >/dev/null
+	bb apply >/dev/null
+	bb mode block >/dev/null
+	# two flows that share nothing with the packets below, and the exact flow we want blocked
+	bb __flow-add 4 198.51.100.1 1111 203.0.113.9 2222 udp 600 >/dev/null
+	bb __flow-add 4 203.0.113.7 3333 198.51.100.2 4444 udp 600 >/dev/null
+	bb __flow-add 4 198.51.100.1 5555 198.51.100.2 6666 udp 600 >/dev/null
+	# 1111 -> 4444 is a mix of the first two flows: it is not a flow and must pass
+	udp_from 1111 4444
+	# the exact flow is cut
+	refute udp_from 5555 6666
+	# the reply direction of a known flow is cut too, an unrelated port still passes
+	udp_from 5556 6666
+}
+@test "R8: nft: only the exact tuple of a flow is blocked" { t_flow_tuple nft; }
+@test "R8: iptables: a mix of two unrelated flows is not blocked, the exact tuple is " { t_flow_tuple iptables; }
+
+@test "R8: iptables: flow sets of the old type are replaced on apply and the rules come back" {
+	bb __init-config --backend iptables --ipv6 no >/dev/null
+	bb apply >/dev/null
+	iptables -t raw -F BB_FILTER
+	for k in src dst; do
+		ipset destroy "bb_flow_$k"4
+		ipset create "bb_flow_$k"4 hash:ip,port family inet timeout 3600
+	done
+	ipset add bb_flow_src4 203.0.113.1,tcp:1 timeout 3600
+	run bb apply
+	[ "$status" -eq 0 ]
+	ipset list -t bb_flow_src4 | grep -q 'Type: hash:ip,port,ip'
+	ipset list -t bb_flow_dst4 | grep -q 'Type: hash:ip,port,ip'
+	bb status --json | jq -e '.rules == "active"' >/dev/null
+	iptables -t raw -S BB_FILTER | grep -q 'bb_flow_src4 src,src,dst'
+}

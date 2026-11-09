@@ -105,7 +105,7 @@ Sets exist for each address family (4 and 6; IPv6 is enabled with `ipv6=yes`, on
 | `manual4/6` | addresses and networks, with timeout | manual bans |
 | `list4/6` | addresses and networks | external lists and trackers |
 | `dht4/6` | "address and port" pairs | DHT bootstrap nodes |
-| `flow_src4/6`, `flow_dst4/6` | "address and port" pairs (`address,udp:port`), with timeout (24 h) | dynamic flows from nDPId: source and destination are kept in two sets (in the nft backend this is a single `flow` set holding the tuple "address, port, address, port") |
+| `flow_src4/6`, `flow_dst4/6` | `hash:ip,port,ip` triples (`src,udp:sport,dst` and `dst,udp:dport,src`), with timeout (24 h) | dynamic flows from nDPId: source and destination are kept in two sets, each with both addresses (in the nft backend this is a single `flow` set holding the tuple "address, port, address, port") |
 
 Check order:
 
@@ -114,7 +114,7 @@ Check order:
 3. `manual` → drop;
 4. `list` → drop;
 5. `dht` (UDP) → drop, taking the port mode into account (section 11);
-6. `flow` → drop: a packet is dropped if its source is in `flow_src` and its destination is in `flow_dst`, or the other way round (the reply direction). A pair of sets instead of one blocks by the tuple "address, port, address, port" rather than by a single address and port, which reduces collateral blocking.
+6. `flow` → drop: a packet is dropped if `(src, sport, dst)` is in `flow_src` and `(dst, dport, src)` is in `flow_dst`, or the other way round (the reply direction). `ipset` has no four-field type, so two triples stand in for the tuple "address, port, address, port": a packet is matched only when both addresses and both ports come from flows between the same two hosts. Two different flows between the same pair of hosts can still match together; flows between different hosts never do. An older set of the type `hash:ip,port` is replaced on `apply` (its flows are learned again).
 
 Important: "pass" only means "do not apply `bb` blocking". The rules of ufw, firewalld, Docker and k8s keep working, and the `bb` allowlist does not cancel their denies.
 
@@ -126,7 +126,7 @@ Important: "pass" only means "do not apply `bb` blocking". The rules of ufw, fir
 
 ### 6.2. The `iptables` + `ipset` backend
 
-- ipset sets: `bb_allow4`, `bb_manual4`, `bb_list4` (`hash:net`), `bb_dht4`, `bb_flow_src4`, `bb_flow_dst4` (`hash:ip,port`), with `family inet6` for IPv6; `maxelem` and `hashsize` are set explicitly (`list_maxelem`, 1,048,576 by default) because the default value (65,536) is too small for large lists;
+- ipset sets: `bb_allow4`, `bb_manual4`, `bb_list4` (`hash:net`), `bb_dht4`, `bb_flow_src4`, `bb_flow_dst4` (`hash:ip,port,ip`), with `family inet6` for IPv6; `maxelem` and `hashsize` are set explicitly (`list_maxelem`, 1,048,576 by default) because the default value (65,536) is too small for large lists;
 - the rules live in the user-defined chain `BB_FILTER` of the **raw** table, hooked as the first rule in `PREROUTING` and `OUTPUT`. The raw table is chosen because its rules run before conntrack and DNAT, do not bloat conntrack and see the original addresses;
 - the chain is rebuilt in a single transaction with `iptables-restore --noflush` (`ip6tables-restore` for IPv6) using the xtables lock wait option (`-w`), so protection never disappears even for a moment. The `-j BB_FILTER` jump is added only after the chain is created; the number of jumps in `PREROUTING` and `OUTPUT` is checked and must be exactly one (duplicates are removed and the jump is inserted first);
 - **jump position.** Other tools (Docker, Calico, etc.) may insert their own rules at the top of raw. Since `ACCEPT` in raw can bypass the rest of the table's rules, `bb-guard` checks that the jump to `BB_FILTER` is first and puts it back if necessary;

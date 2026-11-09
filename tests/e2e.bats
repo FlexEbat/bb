@@ -36,7 +36,7 @@ flow_live() {
 	if [ "${E2E_BACKEND:-nft}" = nft ]; then
 		nft get element inet bb flow4 "{ 198.51.100.1 . 45678 . 198.51.100.2 . 6881 }" >/dev/null 2>&1
 	else
-		ipset test bb_flow_src4 198.51.100.1,tcp:45678 >/dev/null 2>&1 && ipset test bb_flow_dst4 198.51.100.2,tcp:6881 >/dev/null 2>&1
+		ipset test bb_flow_src4 198.51.100.1,tcp:45678,198.51.100.2 >/dev/null 2>&1 && ipset test bb_flow_dst4 198.51.100.2,tcp:6881,198.51.100.1 >/dev/null 2>&1
 	fi
 }
 

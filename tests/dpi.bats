@@ -41,7 +41,7 @@ flow_has() { # fam proto sip sp dip dp
 	if grep -q "^backend='nft'" "$BB_CONF_DIR/bb.conf"; then
 		nft get element inet bb "flow$1" "{ $3 . $4 . $5 . $6 }" >/dev/null 2>&1
 	else
-		ipset test "bb_flow_src$1" "$3,$2:$4" >/dev/null 2>&1 && ipset test "bb_flow_dst$1" "$5,$2:$6" >/dev/null 2>&1
+		ipset test "bb_flow_src$1" "$3,$2:$4,$5" >/dev/null 2>&1 && ipset test "bb_flow_dst$1" "$5,$2:$6,$3" >/dev/null 2>&1
 	fi
 }
 flow_count() { bb show flows | grep -c '^  '; }
