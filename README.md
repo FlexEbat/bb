@@ -7,7 +7,8 @@ Status: under development
 ## Features
 
 - **Blocklists:** import IP/CIDR lists from files or URLs, updated daily by a systemd timer.
-- **DHT and trackers:** bootstrap nodes and public tracker lists are blocked as separate sets.
+- **DHT:** the well-known DHT bootstrap nodes are resolved daily and blocked in their own set (honouring the port mode).
+- **Tracker lists:** `bb` ships no tracker list of its own. Add one as an ordinary list (`bb list add`); tracker URLs such as `udp://host:port/announce` are reduced to the host, resolved, and blocked together with your other lists.
 - **Manual bans and allowlist:** ban with an optional TTL; allowlisted addresses are never blocked.
 - **Optional DPI layer:** [nDPId](https://github.com/utoni/nDPId) detects BitTorrent flows and a small bash listener (parsing events with `jq`) adds them to a set with a TTL.
 - **Notifications:** optional Telegram and Matrix alerts (mode changes, failed or rejected list updates, guard restores, service failures, daily digest), sent with plain `curl`.
