@@ -177,7 +177,7 @@ MSG[uninst_aborted]="Aborted."
 MSG[uninst_done]="bb has been removed completely."
 MSG[uninst_resaved]="Saved rules file %s no longer mentions bb."
 
-MSG[help_install]="Usage: bb install [--backend iptables|nft] [--iface IF] [--ports-mode all|only|except] [--ports LIST]
+MSG[help_install]="Usage: bb install [--backend iptables|nft] [--iface IF[,IF...]] [--ports-mode all|only|except] [--ports LIST]
                   [--no-dpi] [--yes] [--force]
 
 Checks the platform, installs missing packages, backs up the current rules, creates the sets
@@ -344,6 +344,7 @@ MSG[show_flow_line]="  %-10s %s  %ss"
 
 MSG[doc_dpi_bin_ok]="nDPId %s is installed and starts"
 MSG[doc_dpi_bin_fail]="nDPId is missing or does not start: %s"
+MSG[doc_dpi_iface_stopped]="the nDPId instance for the interface %s is not running"
 MSG[doc_dpi_iface_ok]="nDPId inspects the interface %s"
 MSG[doc_dpi_iface_empty]="no interface is set for nDPId (it would inspect lo); set one with bb install --iface NAME"
 MSG[doc_dpi_iface_missing]="the interface %s of nDPId does not exist on this host"

@@ -245,6 +245,27 @@ cfg_defaults() {
 	)
 }
 
+# The interfaces nDPId inspects: one or more names (at most 8) separated by spaces or commas.
+iface_valid() {
+	local -a a=()
+	local w
+	[[ -z $1 ]] && return 0
+	read -ra a <<<"${1//,/ }"
+	((${#a[@]} >= 1 && ${#a[@]} <= 8)) || return 1
+	for w in "${a[@]}"; do [[ $w =~ ^[A-Za-z0-9_.:-]{1,64}$ ]] || return 1; done
+	return 0
+}
+norm_iface() { # "a,b  c" -> "a b c"
+	local -a a=()
+	read -ra a <<<"${1//,/ }"
+	printf '%s' "${a[*]}"
+}
+iface_list() { # one name per line
+	local -a a=()
+	read -ra a <<<"${CFG[iface]//,/ }"
+	((${#a[@]} == 0)) || printf '%s\n' "${a[@]}"
+}
+
 cfg_valid() { # key value
 	local k=$1 v=$2
 	[[ $v != *\'* ]] || return 1 # the file is KEY='value': a quote would break the line
@@ -266,7 +287,7 @@ cfg_valid() { # key value
 		min_list_ratio) is_uint "$v" && ((v <= 100)) ;;
 		integrations) integrations_valid "$v" ;;
 		k8s_pod_cidr | k8s_service_cidr) cidr_list_valid "$v" ;;
-		iface) [[ -z $v || $v =~ ^[A-Za-z0-9_.:@-]{1,64}$ ]] ;;
+		iface) iface_valid "$v" ;;
 		ports_mode) [[ $v == only || $v == all || $v == except ]] ;;
 		ports) [[ -z $v ]] || ports_valid "$v" ;;
 		*) return 1 ;;
@@ -2462,15 +2483,24 @@ doctor_dpi() {
 		doc ok doc_dpi_bin_ok "${ver:-?}"
 	else doc fail doc_dpi_bin_fail "$NDPID_BIN"; fi
 	have jq && doc ok doc_dpi_jq_ok || doc fail doc_dpi_jq_fail
-	if [[ -z ${CFG[iface]} ]]; then doc fail doc_dpi_iface_empty
-	elif have ip && ! ip link show "${CFG[iface]}" >/dev/null 2>&1; then doc fail doc_dpi_iface_missing "${CFG[iface]}"
-	else doc ok doc_dpi_iface_ok "${CFG[iface]}"; fi
+	local -a ifs=()
+	local i
+	mapfile -t ifs < <(iface_list)
+	if ((${#ifs[@]} == 0)); then doc fail doc_dpi_iface_empty
+	else
+		for i in "${ifs[@]}"; do
+			if have ip && ! ip link show "$i" >/dev/null 2>&1; then doc fail doc_dpi_iface_missing "$i"; else doc ok doc_dpi_iface_ok "$i"; fi
+		done
+	fi
 	for u in bb bb-ndpid; do getent passwd "$u" >/dev/null 2>&1 || doc fail doc_dpi_user_fail "$u"; done
 	if have_systemd && have systemctl; then
 		for u in bb-listener.socket bb-ndpid.service; do
 			if systemctl is-enabled --quiet "$u" 2>/dev/null; then doc ok doc_unit_ok "$u"; else doc fail doc_unit_fail "$u"; fi
 		done
 		systemctl is-active --quiet bb-ndpid.service 2>/dev/null || doc warn doc_dpi_notrunning
+		for i in "${ifs[@]:1}"; do
+			systemctl is-active --quiet "bb-ndpid@$i.service" 2>/dev/null || doc warn doc_dpi_iface_stopped "$i"
+		done
 	fi
 	m=$(stat -c %a "$LISTENER_CONF" 2>/dev/null) own=$(stat -c %U:%G "$LISTENER_CONF" 2>/dev/null)
 	if [[ $m == 640 && $own == root:bb ]]; then doc ok doc_dpi_conf_ok; else doc fail doc_dpi_conf_fail "${own:-?} ${m:-?}"; fi
@@ -2903,7 +2933,7 @@ listener_conf_write() {
 # ---- install / uninstall -------------------------------------------------------
 OS_FAMILY="" OS_ID=""
 PLAN_BACKEND="" PLAN_PKGS=""
-UNIT_NAMES="bb-sets.service bb-firewall.service bb-update.service bb-update.timer bb-guard.service bb-guard.timer bb-digest.service bb-digest.timer bb-notify-failure@.service bb-listener.socket bb-listener@.service bb-ndpid.service"
+UNIT_NAMES="bb-sets.service bb-firewall.service bb-update.service bb-update.timer bb-guard.service bb-guard.timer bb-digest.service bb-digest.timer bb-notify-failure@.service bb-listener.socket bb-listener@.service bb-ndpid@.service bb-ndpid.service"
 
 os_info() { # sets OS_FAMILY (apt|dnf|unknown) and OS_ID
 	local line id="" like="" tok
@@ -3049,17 +3079,30 @@ ProtectSystem=strict
 ReadWritePaths=-/etc/bb -/var/lib/bb -/var/backups/bb /run
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_DAC_OVERRIDE CAP_FOWNER CAP_CHOWN'
 
-unit_text() { # name
-	local bin=$BIN_PATH wants="" guard onfail="OnFailure=bb-notify-failure@%n.service" ndpid flag filter
-	# D-010: verified on nDPId 1.7: started as an unprivileged user it tries to switch to "nobody" and
-	# exits unless -u/-g name its own user; it opens one collector connection per reader thread
-	# (10 by default), so the threads are capped to fit the socket's connection limit.
-	ndpid="$NDPID_BIN -i ${CFG[iface]:-lo} -c /run/bb/ndpid.sock -u bb-ndpid -g bb-ndpid -a bb -o max-reader-threads=4"
+# The command line of one nDPId instance (the interface is a name or the unit's %i).
+# D-010: verified on nDPId 1.7: started as an unprivileged user it tries to switch to "nobody" and
+# exits unless -u/-g name its own user; it opens one collector connection per reader thread
+# (10 by default), so the threads are capped to fit the socket's connection limit.
+ndpid_cmd() { # interface alias
+	local cmd="$NDPID_BIN -i $1 -c /run/bb/ndpid.sock -u bb-ndpid -g bb-ndpid -a $2 -o max-reader-threads=4" filter flag
 	filter=$(dpi_bpf_filter)
 	if [[ -n $filter ]]; then
 		flag=$(ndpid_bpf_flag 2>/dev/null)
-		[[ -n $flag ]] && ndpid+=" $flag \"$filter\""
+		[[ -n $flag ]] && cmd+=" $flag \"$filter\""
 	fi
+	printf '%s' "$cmd"
+}
+
+# One nDPId process watches one interface: the first one is bb-ndpid.service, every other one is an
+# instance of bb-ndpid@.service that belongs to it (PartOf), so that the one name starts and stops all.
+unit_text() { # name
+	local bin=$BIN_PATH wants="" guard onfail="OnFailure=bb-notify-failure@%n.service" ndpid ndpid_wants="" nif=1 i
+	local -a ifs=()
+	mapfile -t ifs < <(iface_list)
+	((${#ifs[@]} > 0)) && nif=${#ifs[@]}
+	for i in "${ifs[@]:1}"; do ndpid_wants+=" bb-ndpid@$i.service"; done
+	[[ -z $ndpid_wants ]] || ndpid_wants="Wants=${ndpid_wants# }"
+	ndpid=$(ndpid_cmd "${ifs[0]:-lo}" bb)
 	guard=$(dur2sec "${CFG[guard_interval]}")
 	[[ ${CFG[backend]} == iptables ]] && wants="Wants=bb-sets.service"
 	case $1 in
@@ -3206,7 +3249,7 @@ SocketGroup=bb-ndpid
 SocketMode=0600
 DirectoryMode=0755
 Accept=yes
-MaxConnections=8
+MaxConnections=$((4 * nif + 4))
 
 [Install]
 WantedBy=sockets.target
@@ -3243,6 +3286,7 @@ EOF
 Description=bb: nDPId traffic inspection
 $onfail
 Requires=bb-listener.socket
+$ndpid_wants
 After=bb-listener.socket bb-firewall.service network.target
 
 [Service]
@@ -3262,6 +3306,29 @@ CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN
 WantedBy=multi-user.target
 EOF
 			;;
+		bb-ndpid@.service)
+			cat <<EOF
+[Unit]
+Description=bb: nDPId traffic inspection on %i
+$onfail
+PartOf=bb-ndpid.service
+Requires=bb-listener.socket
+After=bb-listener.socket bb-firewall.service network.target
+
+[Service]
+User=bb-ndpid
+Group=bb-ndpid
+ExecStart=$(ndpid_cmd %i bb-%i)
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+ProtectHome=yes
+PrivateTmp=yes
+ProtectSystem=strict
+AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN
+EOF
+			;;
 		*) return 1 ;;
 	esac | awk 'NF || prev { print } { prev = NF }' # drop the blank line an empty $wants leaves
 }
@@ -3273,6 +3340,7 @@ units_install() {
 		case $u in
 			bb-sets.service) [[ ${CFG[backend]} == iptables ]] || { rm -f -- "$UNIT_DIR/$u"; continue; } ;;
 			bb-listener.socket | bb-listener@.service | bb-ndpid.service) [[ ${CFG[dpi]} == yes ]] || { rm -f -- "$UNIT_DIR/$u"; continue; } ;;
+			bb-ndpid@.service) [[ ${CFG[dpi]} == yes && $(iface_list | wc -l) -gt 1 ]] || { rm -f -- "$UNIT_DIR/$u"; continue; } ;;
 		esac
 		tmp=$UNIT_DIR/$u.new
 		unit_text "$u" >"$tmp" && chmod 0644 "$tmp" && mv -f -- "$tmp" "$UNIT_DIR/$u" || return 1
@@ -3282,6 +3350,13 @@ units_install() {
 	systemctl enable bb-firewall.service bb-update.timer bb-guard.timer >/dev/null 2>&1 || return 1
 	[[ ${CFG[backend]} == iptables ]] && { systemctl enable bb-sets.service >/dev/null 2>&1 || return 1; }
 	if [[ ${CFG[dpi]} == yes ]]; then systemctl enable bb-listener.socket bb-ndpid.service >/dev/null 2>&1 || return 1; fi
+	# an interface that was taken out of the list must stop being inspected
+	local running keep
+	keep=$(iface_list | tail -n +2)
+	for u in $(systemctl list-units 'bb-ndpid@*.service' --all --plain --no-legend 2>/dev/null | awk '{ print $1 }'); do
+		running=${u#bb-ndpid@}; running=${running%.service}
+		[[ ${CFG[dpi]} == yes ]] && grep -qxF -- "$running" <<<"$keep" || systemctl stop "$u" >/dev/null 2>&1
+	done
 	return 0
 }
 
@@ -3363,6 +3438,7 @@ cmd_install() {
 	[[ -z $want ]] || cfg_valid backend "$want" || die err_cfg_invalid backend "$want"
 	[[ -z $pmode ]] || cfg_valid ports_mode "$pmode" || die err_cfg_invalid ports_mode "$pmode"
 	[[ -z $ports ]] || ports_valid "$ports" || die err_cfg_invalid ports "$ports"
+	iface=$(norm_iface "$iface")
 	[[ -z $iface ]] || cfg_valid iface "$iface" || die err_cfg_invalid iface "$iface"
 	if [[ $pmode == only || $pmode == except ]] && [[ -z $ports ]]; then die err_ports_required; fi
 
@@ -3412,6 +3488,7 @@ cmd_install() {
 	fi
 	[[ -n $pmode ]] || pmode=${CFG[ports_mode]}
 	[[ $pmode == all || -n $ports ]] || ports=${CFG[ports]}
+	iface=$(norm_iface "$iface")
 	cfg_valid iface "$iface" || die err_cfg_invalid iface "$iface"
 	if ((dpi)) && [[ -z $iface ]]; then die err_dpi_no_iface; fi
 	cfg_valid ports_mode "$pmode" || die err_cfg_invalid ports_mode "$pmode"
@@ -3569,7 +3646,7 @@ cmd_uninstall() {
 		done <"$MANIFEST"
 	fi
 	NOTIFY_SYNC=1 log_event "uninstall"
-	systemctl stop 'bb-listener@*.service' >/dev/null 2>&1
+	systemctl stop 'bb-listener@*.service' 'bb-ndpid@*.service' >/dev/null 2>&1
 	for u in $UNIT_NAMES bb-mode-rollback.timer; do
 		systemctl stop "$u" >/dev/null 2>&1
 		systemctl disable "$u" >/dev/null 2>&1

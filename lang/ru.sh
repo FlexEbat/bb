@@ -176,7 +176,7 @@ MSG[uninst_aborted]="Отменено."
 MSG[uninst_done]="bb полностью удалён."
 MSG[uninst_resaved]="Файл сохранённых правил %s больше не упоминает bb."
 
-MSG[help_install]="Использование: bb install [--backend iptables|nft] [--iface ИНТЕРФЕЙС] [--ports-mode all|only|except] [--ports СПИСОК]
+MSG[help_install]="Использование: bb install [--backend iptables|nft] [--iface ИНТЕРФЕЙС[,ИНТЕРФЕЙС...]] [--ports-mode all|only|except] [--ports СПИСОК]
                        [--no-dpi] [--yes] [--force]
 
 Проверяет платформу, ставит недостающие пакеты, делает резервную копию текущих правил, создаёт наборы
@@ -344,6 +344,7 @@ MSG[show_flow_line]="  %-10s %s  %s с"
 
 MSG[doc_dpi_bin_ok]="nDPId %s установлен и запускается"
 MSG[doc_dpi_bin_fail]="nDPId отсутствует или не запускается: %s"
+MSG[doc_dpi_iface_stopped]="экземпляр nDPId для интерфейса %s не запущен"
 MSG[doc_dpi_iface_ok]="nDPId анализирует интерфейс %s"
 MSG[doc_dpi_iface_empty]="для nDPId не задан интерфейс (он анализировал бы lo); задайте его: bb install --iface ИМЯ"
 MSG[doc_dpi_iface_missing]="интерфейса %s, который использует nDPId, нет на этом хосте"

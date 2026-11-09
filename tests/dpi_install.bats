@@ -276,3 +276,73 @@ STUB
 	nft get element inet bb flow4 "{ 203.0.113.10 . 41000 . 198.51.100.20 . 6881 }" >/dev/null   # flows were added by an unprivileged process
 	nft get element inet bb flow6 "{ 2001:db8::10 . 42000 . 2001:db8:1::20 . 6881 }" >/dev/null
 }
+
+# several interfaces: one nDPId process each
+@test "several interfaces: the first is bb-ndpid.service, the others are instances that belong to it" {
+	run bb install --backend nft --yes --iface lo,eth1,eth2
+	echo "$output"
+	[ "$status" -eq 0 ]
+	grep -q "^iface='lo eth1 eth2'" "$BB_CONF_DIR/bb.conf"
+	n=$(unit bb-ndpid.service)
+	[[ $n == *"ExecStart=$BB_NDPID_BIN -i lo -c /run/bb/ndpid.sock -u bb-ndpid -g bb-ndpid -a bb -o max-reader-threads=4"* ]]
+	[[ $n == *"Wants=bb-ndpid@eth1.service bb-ndpid@eth2.service"* ]]
+	t=$(unit 'bb-ndpid@.service')
+	[[ $t == *"PartOf=bb-ndpid.service"* && $t == *"Requires=bb-listener.socket"* && $t == *"User=bb-ndpid"* ]]
+	[[ $t == *"ExecStart=$BB_NDPID_BIN -i %i -c /run/bb/ndpid.sock -u bb-ndpid -g bb-ndpid -a bb-%i -o max-reader-threads=4"* ]]
+	[[ $t == *"CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN"* ]]
+	# every nDPId process opens up to 4 connections: 4 per interface and 4 spare
+	[[ $(unit bb-listener.socket) == *"MaxConnections=16"* ]]
+	if command -v systemd-analyze >/dev/null; then
+		rm -f "$BB_UNIT_DIR"/*.new
+		run systemd-analyze verify "$BB_UNIT_DIR"/bb-listener.socket "$BB_UNIT_DIR"/bb-ndpid.service "$BB_UNIT_DIR"/bb-ndpid@.service "$BB_UNIT_DIR"/bb-listener@.service
+		echo "$output"; [[ $output != *"error"* && $output != *"cycle"* ]]
+	fi
+}
+
+@test "one interface: no instance unit, no Wants line, the usual connection limit" {
+	install_dpi >/dev/null
+	[ ! -e "$BB_UNIT_DIR/bb-ndpid@.service" ]
+	[[ $(unit bb-ndpid.service) != *"bb-ndpid@"* ]]
+	[[ $(unit bb-listener.socket) == *"MaxConnections=8"* ]]
+}
+
+@test "several interfaces: the list is validated and commas are accepted" {
+	run bb install --backend nft --yes --iface 'lo;eth1'; [ "$status" -ne 0 ]
+	run bb install --backend nft --yes --iface 'eth0@if3'; [ "$status" -ne 0 ]
+	run bb install --backend nft --yes --iface 'a,b,c,d,e,f,g,h,i'; [ "$status" -ne 0 ]
+	[ ! -e "$BB_CONF_DIR/bb.conf" ] || ! grep -q '^backend=' "$BB_CONF_DIR/bb.conf"
+	run bb install --backend nft --yes --iface 'lo, eth1'; [ "$status" -eq 0 ]
+	grep -q "^iface='lo eth1'" "$BB_CONF_DIR/bb.conf"
+}
+
+@test "several interfaces: an interface taken out of the list is stopped; uninstall stops all instances" {
+	cat >"$R/stubs/systemctl" <<STUB
+#!/bin/sh
+echo "systemctl \$*" >>"$R/sd.log"
+case "\$1" in list-units) printf 'bb-ndpid@eth1.service loaded active running x\nbb-ndpid@eth2.service loaded active running x\n' ;; is-enabled|is-active) exit 0 ;; esac
+exit 0
+STUB
+	bb install --backend nft --yes --iface lo,eth1,eth2 >/dev/null
+	: >"$R/sd.log"
+	bb install --backend nft --yes --force --iface lo,eth1 >/dev/null
+	grep -q 'stop bb-ndpid@eth2.service' "$R/sd.log"
+	! grep -q 'stop bb-ndpid@eth1.service' "$R/sd.log"
+	: >"$R/sd.log"
+	run bb uninstall --yes
+	[ "$status" -eq 0 ]
+	grep -q "stop bb-listener@\*.service bb-ndpid@\*.service" "$R/sd.log"
+	[ ! -e "$BB_UNIT_DIR/bb-ndpid@.service" ]
+}
+
+@test "doctor checks every interface of nDPId and the instance of each extra one" {
+	bb install --backend nft --yes --iface lo,nosuch0 >/dev/null
+	cat >"$R/stubs/systemctl" <<STUB
+#!/bin/sh
+case "\$1" in is-active) case "\$3" in bb-ndpid@nosuch0.service) exit 3 ;; esac ;; esac
+exit 0
+STUB
+	run bb doctor --json
+	jq -e '([.checks[] | select(.id == "dpi_iface_ok")][0].args == ["lo"])
+		and ([.checks[] | select(.id == "dpi_iface_missing")][0].args == ["nosuch0"])
+		and ([.checks[] | select(.id == "dpi_iface_stopped")][0].args == ["nosuch0"])' <<<"$output" >/dev/null
+}

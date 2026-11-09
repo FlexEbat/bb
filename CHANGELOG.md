@@ -17,4 +17,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Integrations with Docker, k3s/k8s, ufw and firewalld, and `bb doctor`.
 - Dynamic layer: nDPId build, the listener and `bb show flows`.
 - `bb status --json` and `bb doctor --json`; `bb log [-f] [-n N]` for the journal and kernel messages.
+- Several interfaces for traffic inspection: `--iface eth0,eth1` starts one nDPId process for each.
 - English and Russian interface.

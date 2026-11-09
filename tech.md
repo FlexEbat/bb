@@ -179,6 +179,12 @@ List sanitizing: private and special-purpose ranges (RFC 1918, 100.64.0.0/10, lo
 
 Entries broader than /8 (IPv4) or /16 (IPv6) are rejected, so that one bad line cannot block everything (see D-005).
 
+### Several interfaces
+
+nDPId watches one interface per process, so `iface` may hold up to 8 names (separated by spaces or commas, `--iface eth0,eth1`; letters, digits and `_ . : -`). The first one is watched by `bb-ndpid.service`, every other one by an instance `bb-ndpid@NAME.service` of the template `bb-ndpid@.service`; `bb-ndpid.service` pulls the instances in (`Wants=`) and they belong to it (`PartOf=`), so starting, stopping or restarting that one name acts on all of them. All processes send their events to the same listener socket, whose connection limit is 4 for each interface plus 4. `bb doctor` checks every interface and every instance. When `bb install` is run again with a shorter list, the instances of the removed interfaces are stopped, and `bb uninstall` stops all of them.
+
+A forwarded packet can be seen on two interfaces. Every nDPId connection has its own listener process with its own dedup, so a flow that two processes report is handled twice; this is harmless, because adding an entry to a set that already holds it only renews its timeout.
+
 ### Failure handling and locking
 
 - The allowlist, the internal networks and the manual bans are critical: if one of those sets cannot be loaded, `apply` rolls back. The blocklists and the DHT nodes are not: if they cannot be loaded (for example a list larger than `list_maxelem` on the `ipset` backend), the rules are still applied without them, the failure is reported (`list_update_failed ... reason=load`) and `guard` can still restore the protection.
@@ -273,7 +279,7 @@ Individual DPI blocks are not sent one by one; they appear only in the digest.
 ## 10. CLI
 
 ```
-bb install [--lang en|ru] [--backend iptables|nft] [--iface IFACE]
+bb install [--lang en|ru] [--backend iptables|nft] [--iface IFACE[,IFACE...]]
            [--ports-mode only|all|except] [--ports LIST] [--no-dpi] [--yes] [--force]
 bb status [--json]               services, set sizes, drop counters, backend
 bb doctor [--json]               diagnostics (see below)
@@ -399,7 +405,8 @@ The configuration consists of `KEY='value'` lines, is read by a strict parser (n
 | `bb-guard.timer` / `.service` | checks the rules and their position, reapplies them if they disappear, refreshes integration subnets |
 | `bb-digest.timer` / `.service` | daily digest (if the `digest` event is enabled) |
 | `bb-notify-failure@.service` | template unit invoked through `OnFailure=` for `bb` units; sends `service_failed` |
-| `bb-ndpid.service` | nDPId with `-c` pointing at the listener socket, `Requires=bb-listener.socket` (only when DPI is enabled) |
+| `bb-ndpid.service` | nDPId with `-c` pointing at the listener socket, `Requires=bb-listener.socket` (only when DPI is enabled); it watches the first interface |
+| `bb-ndpid@.service` | one more nDPId process for each further interface (`-i %i -a bb-%i`, `PartOf=bb-ndpid.service`); only when several interfaces are set |
 | `bb-listener.socket` / `bb-listener@.service` | socket for nDPId (socket activation, `Accept=yes`) and a listener instance per connection (only when DPI is enabled) |
 
 Logging: through journald, `bb` events carry the tag `bb` (`journalctl -t bb`), rule messages with the prefix `bb:` go to the kernel log. `bb log -f` merges both sources. A separate log file and rotation are not needed.
@@ -775,4 +782,4 @@ A deviation is a place where the implementation deliberately does something othe
 | D-007 | §11 | nDPId is cloned with `git clone --depth 1 --branch <ref>` (a full clone and a checkout when the reference is a commit) and only the `libnDPI` submodule is initialised, instead of `git clone --recursive`. | The other submodules are examples that are never built (`BUILD_EXAMPLES=OFF`) and are hosted on a second server, which makes the build fail on restricted networks. | active | (tests/dpi_install.bats: the build clones the pinned tag and initialises only libnDPI) |
 | D-008 | §6.4, §13 | The socket of `bb-listener.socket` belongs to the nDPId user (`SocketUser=bb-ndpid`, mode 0600) and not to root. | The text asks for nDPId to run as a separate user and for a socket that only root can use, which would keep nDPId from connecting. | active | (tests/dpi_install.bats: units: the socket belongs to the nDPId user) |
 | D-009 | §6.4, §13 | The listener (user `bb`) reads a root-written copy of its settings from `/var/lib/bb/listener.conf`, writes only to `/var/lib/bb/listener/`, reads the allowlist from the live kernel set, and leaves `rate_limit` notes that the guard turns into notifications (so such a notification can be up to `guard_interval` late). | `bb.conf` and `notify.conf` are root-only, so an unprivileged listener cannot read them or send notifications itself, and a narrower writable path than `/var/lib/bb` keeps it from touching root's files. | active | (tests/dpi_install.bats: the listener runs as an unprivileged user with CAP_NET_ADMIN and nothing else) (tests/dpi.bats: exceeding the rate limit pauses the listener and raises rate_limit once) |
-| D-010 | §6.4 | nDPId is started with `-u bb-ndpid -g bb-ndpid -a bb -o max-reader-threads=4`, and the socket accepts 8 connections instead of 4. | Verified on nDPId 1.7: started as an unprivileged user it tries to switch to `nobody` and exits unless `-u` and `-g` name its own user, and it opens one collector connection per reader thread (10 by default), so a limit of 4 would turn most of them away. | active | (tests/dpi_install.bats: units: the socket belongs to the nDPId user) (tests/e2e.bats: a live BitTorrent connection is detected) |
+| D-010 | §6.4 | nDPId is started with `-u bb-ndpid -g bb-ndpid -a bb -o max-reader-threads=4`, and the socket accepts 8 connections instead of 4 (4 more for each additional interface, see "Several interfaces"). | Verified on nDPId 1.7: started as an unprivileged user it tries to switch to `nobody` and exits unless `-u` and `-g` name its own user, and it opens one collector connection per reader thread (10 by default), so a limit of 4 would turn most of them away. | active | (tests/dpi_install.bats: units: the socket belongs to the nDPId user) (tests/e2e.bats: a live BitTorrent connection is detected) |

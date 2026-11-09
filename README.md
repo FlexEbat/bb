@@ -56,7 +56,7 @@ sudo bb notify test
 ## Commands
 
 ```
-bb install [--lang en|ru] [--backend iptables|nft] [--iface IFACE] [--ports-mode only|all|except]
+bb install [--lang en|ru] [--backend iptables|nft] [--iface IFACE[,IFACE...]] [--ports-mode only|all|except]
            [--ports LIST] [--no-dpi] [--yes] [--force]
 bb status                     bb doctor                     bb show flows
 bb apply                      bb guard
