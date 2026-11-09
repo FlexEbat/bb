@@ -137,6 +137,7 @@ t_dht_empty_keeps() {
 }
 
 t_ipv6_block() {
+	if [[ $1 == iptables ]] && ! ip6tables -w -t raw -S >/dev/null 2>&1; then skip "ip6tables cannot use the raw table here"; fi
 	init_fw "$1"; bb apply
 	if ! ping -6 -c1 -W1 fd99::2 >/dev/null 2>&1; then skip "IPv6 not usable in this environment"; fi
 	bb ban fd99::2; bb mode block

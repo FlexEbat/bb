@@ -11,12 +11,14 @@ defaults:
 jobs:
   lint:
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - run: sudo bash tests/matrix/deps.sh
       - run: make lint && make spec
   suite:                       # S9.1: Debian, Ubuntu, RHEL family and Fedora
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -28,12 +30,13 @@ jobs:
       - run: (command -v apt-get >/dev/null && apt-get update -qq && apt-get install -y -qq git) || dnf install -y git
       - uses: actions/checkout@v4
       - run: bash tests/matrix/deps.sh
-      - run: tests/run.sh 2>&1 | tee ci.log; exit "${PIPESTATUS[0]}"
+      - run: bash tests/matrix/suite.sh 2>&1 | tee ci.log; exit "${PIPESTATUS[0]}"
       - if: always()
         env: { GITHUB_TOKEN: "${{ github.token }}" }
         run: bash tests/matrix/publish-log.sh "suite-${{ matrix.image }}"
   legacy:                      # S9.2
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
     container:
       image: debian:12
       options: --privileged
@@ -47,6 +50,7 @@ jobs:
         run: bash tests/matrix/publish-log.sh legacy
   host:                        # S9.3, S9.5, S9.6 on a real systemd host with Docker
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - run: sudo bash tests/matrix/deps.sh
