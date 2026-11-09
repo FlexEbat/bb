@@ -499,11 +499,11 @@ The work is split into vertical slices, done in order. A slice is closed when ev
 | S1 | Core | partial | 16/17 |
 | S2 | Static lists | done | 9/9 |
 | S3 | DHT nodes | done | 4/4 |
-| S4 | Installation and operation | partial | 15/16 |
+| S4 | Installation and operation | done | 16/16 |
 | S5 | Notifications | partial | 11/12 |
 | S6 | Integrations and diagnostics | partial | 8/9 |
 | S7 | Dynamic layer (nDPId and the listener) | partial | 18/20 |
-| S8 | Machine-readable output and logs | partial | 2/3 |
+| S8 | Machine-readable output and logs | done | 3/3 |
 | S9 | Test matrix and CI | partial | 3/7 |
 | S10 | Documentation and release | partial | 3/4 |
 
@@ -607,7 +607,7 @@ The work is split into vertical slices, done in order. A slice is closed when ev
 13. [x] **S4.13** `bb uninstall` removes the packages `bb` installed, dependencies included, and keeps any package whose removal would also remove other software. (tests/install.bats: uninstall (apt) removes the packages bb installed, dependencies included, and nothing else) (tests/install.bats: uninstall keeps a package other software depends on, and says so) (tests/install.bats: uninstall (dnf) keeps packages that other installed software requires)
 14. [x] **S4.14** Saved rule files that referenced `bb` objects are re-saved without them. (tests/install.bats: uninstall removes everything of bb, only bb objects of the firewall, and cleans saved rule files)
 15. [x] **S4.15** `bb uninstall` asks for confirmation on a terminal and needs `--yes` otherwise. (tests/install.bats: uninstall needs --yes without a terminal)
-16. [x] **S4.16** The units start under a real systemd. Besides `systemd-analyze` and stubs here, `tests/matrix/host.sh` installed bb on a CI host with real systemd: the units and timers were enabled and active, `bb doctor` was clean and `bb-firewall` restarted with the rules intact (manual: CI run for commit 2ae3247).
+16. [x] **S4.16** The units start under a real systemd. Besides `systemd-analyze` and stubs here, `tests/matrix/host.sh` installed bb on a CI host with real systemd: the units and timers were enabled and active, `bb doctor` was clean and `bb-firewall` restarted with the rules intact, in the CI run for commit 2ae3247 (manual).
 
 **Tests:** `tests/install.bats`.
 
