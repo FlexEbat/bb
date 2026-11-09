@@ -44,6 +44,7 @@ MSG[warn_list_sha]="list %s does not match its sha256; the existing set was kept
 MSG[warn_list_shrunk]="list %s shrank sharply (%s -> %s entries); the existing set was kept"
 MSG[warn_set_degraded]="could not load the %s set; the rules are applied without it (see the journal)"
 MSG[warn_list_too_many]="list %s has %s entries, more than list_maxelem (%s); keeping the old data"
+MSG[warn_resolve_budget]="name resolution was cut off after %s seconds; names that were not resolved are skipped"
 MSG[warn_list_too_big]="list %s exceeds the size limit; the existing set was kept"
 MSG[warn_set_op]="could not update the live set for %s; it will be loaded on the next 'bb apply'"
 
@@ -336,6 +337,8 @@ MSG[chk_dpi_user]="user %s is missing"
 MSG[chk_dpi_conf]="the listener configuration is missing"
 
 MSG[show_flows_head]="Dynamic flows (set, entry, seconds left):"
+MSG[show_flows_more]="... and %s more (bb show flows --all lists everything)"
+MSG[doc_flows_full]="the flow set %s holds %s of %s entries (flow_maxelem): new flows will be dropped when it is full"
 MSG[show_flows_none]="There are no dynamic flows."
 MSG[show_flow_line]="  %-10s %s  %ss"
 
@@ -353,6 +356,7 @@ MSG[doc_dpi_conf_ok]="listener.conf belongs to root:bb with mode 0640"
 MSG[doc_dpi_conf_fail]="listener.conf must belong to root:bb with mode 0640 (found %s)"
 MSG[doc_dpi_dir_warn]="the listener's directory is missing or not owned by bb"
 
-MSG[help_show]="Usage: bb show flows
+MSG[help_show]="Usage: bb show flows [--limit N | --all]
 
-Lists the flows that traffic inspection added (the dynamic sets) with the seconds left of each."
+Lists the flows that traffic inspection added (the dynamic sets) with the seconds left of each.
+By default the first 1000 are shown."

@@ -173,3 +173,87 @@ t_flow_tuple() {
 	bb status --json | jq -e '.rules == "active"' >/dev/null
 	iptables -t raw -S BB_FILTER | grep -q 'bb_flow_src4 src,src,dst'
 }
+
+# R5: name resolution is parallel and has an overall budget
+hosts_list() { # count -> a list file with that many names
+	local i; : >"$R/hosts.txt"
+	for i in $(seq 1 "$1"); do echo "h$i.test.example" >>"$R/hosts.txt"; done
+}
+slow_getent() { # seconds per name
+	cat >"$R/stubs/getent" <<STUB
+#!/bin/sh
+[ "\$1" = ahosts ] || exec /usr/bin/getent "\$@"
+sleep $1
+n=\$(printf '%s' "\$2" | tr -dc '0-9')
+echo "198.51.100.\$n \$2"
+STUB
+	chmod +x "$R/stubs/getent"
+}
+
+@test "R5: many names are resolved in parallel, not one after another" {
+	bb __init-config --backend nft --ipv6 no >/dev/null
+	slow_getent 2
+	hosts_list 32                                  # 32 names x 2 s: 64 s one by one
+	bb list add t "$R/hosts.txt" >/dev/null
+	start=$SECONDS
+	run bb list update t
+	[ "$status" -eq 0 ]
+	[ $((SECONDS - start)) -lt 20 ]
+	[ "$(wc -l <"$BB_STATE_DIR/lists/t.list")" -eq 32 ]
+}
+
+@test "R5: resolve_budget cuts the resolution off, with a warning, and keeps the old data" {
+	bb __init-config --backend nft --ipv6 no >/dev/null
+	setcfg resolve_budget 2
+	slow_getent 4
+	hosts_list 4
+	bb list add t "$R/hosts.txt" >/dev/null
+	mkdir -p "$BB_STATE_DIR/lists"
+	printf '198.51.100.200\n' >"$BB_STATE_DIR/lists/t.list"; printf "count='1'\nupdated='1'\n" >"$BB_STATE_DIR/lists/t.meta"
+	start=$SECONDS
+	run bb list update t
+	[ "$status" -ne 0 ]
+	[ $((SECONDS - start)) -lt 12 ]
+	[[ $output == *"cut off after 2 seconds"* ]]
+	[ "$(cat "$BB_STATE_DIR/lists/t.list")" = 198.51.100.200 ]
+}
+
+# show flows, the fill of the flow set, and a clock that went backwards
+@test "show flows: --limit and --all, a default cap, bad arguments, both languages" {
+	bb __init-config --backend nft --ipv6 no >/dev/null; bb apply >/dev/null
+	for p in 1 2 3 4 5; do bb __flow-add 4 203.0.113.1 $p 198.51.100.1 6881 tcp 600 >/dev/null; done
+	run bb show flows --limit 2
+	[ "$(grep -c '^  ' <<<"$output")" -eq 2 ]
+	[[ $output == *"and 3 more"* ]]
+	run bb --lang ru show flows --limit 2
+	[[ $output == *"и ещё 3"* ]]
+	run bb show flows --all
+	[ "$(grep -c '^  ' <<<"$output")" -eq 5 ]; [[ $output != *"more"* ]]
+	run bb show flows
+	[ "$(grep -c '^  ' <<<"$output")" -eq 5 ]
+	run bb show flows --limit 0; [ "$status" -ne 0 ]
+	run bb show flows --limit; [ "$status" -ne 0 ]
+	run bb show flows --bogus; [ "$status" -ne 0 ]
+	run bb show flows --help; [[ $output == *"--limit N"* ]]
+}
+
+@test "doctor warns when a flow set is almost full" {
+	bb __init-config --backend nft --ipv6 no >/dev/null
+	setcfg dpi yes; setcfg flow_maxelem 5; setcfg iface lo
+	bb apply >/dev/null
+	run bb doctor --json
+	jq -e '[.checks[] | select(.id == "flows_full")] | length == 0' <<<"$output" >/dev/null
+	for p in 1 2 3 4; do bb __flow-add 4 203.0.113.1 $p 198.51.100.1 6881 tcp 600 >/dev/null; done
+	run bb doctor --json
+	jq -e '[.checks[] | select(.id == "flows_full")][0] | .level == "warn" and .args == ["flow4", "4", "5"]' <<<"$output" >/dev/null
+}
+
+@test "saved flows are not given a longer life when the clock is behind the saved time" {
+	bb __init-config --backend nft --ipv6 no >/dev/null; bb apply >/dev/null
+	printf '# saved %s\nnft\tflow4\t203.0.113.1 . 1 . 198.51.100.1 . 2\t600\n' "$(($(date +%s) + 100000))" >"$BB_STATE_DIR/flows.save"
+	nft delete table inet bb
+	bb apply >/dev/null
+	run bb show flows
+	left=$(awk '/^  /{ print $NF; exit }' <<<"$output"); left=${left%s}
+	[ -n "$left" ] && [ "$left" -le 600 ] && [ "$left" -gt 0 ]
+}

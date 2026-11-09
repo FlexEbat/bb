@@ -173,7 +173,7 @@ The protocol details below are re-verified whenever the nDPId version changes.
 
 **Allowlist**: gateway, DNS, administrator addresses. It is checked before any blocking. At install time the default gateway, the DNS servers from the system configuration and the IP of the current SSH session are added automatically. Integrations (section 8) add container and cluster subnets.
 
-List file format: one entry per line (IP or CIDR), lines starting with `#` and empty lines are ignored, hosts are resolved on update.
+List file format: one entry per line (IP or CIDR), lines starting with `#` and empty lines are ignored, hosts are resolved on update. Names are resolved 16 at a time (5 seconds at most for each, at most `resolve_max` names per list) and the whole resolution is cut off after `resolve_budget` seconds (120 by default); names that are not resolved by then are skipped and a warning is printed.
 
 List sanitizing: private and special-purpose ranges (RFC 1918, 100.64.0.0/10, loopback, link-local, ULA `fc00::/7`) are removed from external lists unless `strip_private=no`. This keeps container and cluster networks from being blocked.
 
