@@ -607,7 +607,7 @@ The work is split into vertical slices, done in order. A slice is closed when ev
 13. [x] **S4.13** `bb uninstall` removes the packages `bb` installed, dependencies included, and keeps any package whose removal would also remove other software. (tests/install.bats: uninstall (apt) removes the packages bb installed, dependencies included, and nothing else) (tests/install.bats: uninstall keeps a package other software depends on, and says so) (tests/install.bats: uninstall (dnf) keeps packages that other installed software requires)
 14. [x] **S4.14** Saved rule files that referenced `bb` objects are re-saved without them. (tests/install.bats: uninstall removes everything of bb, only bb objects of the firewall, and cleans saved rule files)
 15. [x] **S4.15** `bb uninstall` asks for confirmation on a terminal and needs `--yes` otherwise. (tests/install.bats: uninstall needs --yes without a terminal)
-16. [~] **S4.16** The units start under a real systemd. They are only checked with `systemd-analyze` and stubs here; covered by slice 9.
+16. [x] **S4.16** The units start under a real systemd. Besides `systemd-analyze` and stubs here, `tests/matrix/host.sh` installed bb on a CI host with real systemd: the units and timers were enabled and active, `bb doctor` was clean and `bb-firewall` restarted with the rules intact (manual: CI run for commit 2ae3247).
 
 **Tests:** `tests/install.bats`.
 
@@ -711,7 +711,7 @@ The work is split into vertical slices, done in order. A slice is closed when ev
 
 1. [x] **S8.1** `bb status --json` and `bb doctor --json` are valid JSON with stable keys and untranslated values. (tests/json.bats: status --json is valid JSON with stable keys on both backends) (tests/json.bats: status --json reports inactive rules with empty sets) (tests/json.bats: status --json and doctor --json are the same in both languages) (tests/json.bats: doctor --json lists checks with level, stable id and raw arguments) (tests/json.bats: doctor --json keeps the exit code and the untranslated ufw state) (tests/json.bats: doctor --json works on an unconfigured host)
 2. [x] **S8.2** Without `jq` a hint is printed and the exit code is non-zero. (tests/json.bats: without jq a hint is printed and the exit code is non-zero, in both languages)
-3. [~] **S8.3** `bb log -f` merges the journal tag `bb` and the kernel messages with the prefix `bb:`. The query (`SYSLOG_IDENTIFIER=bb + _TRANSPORT=kernel`, then a filter on the kernel prefix) is tested against a `journalctl` stand-in here, and on a real journal by `tests/matrix/host.sh` in CI (a first version with `-t bb + ...` was rejected by the real `journalctl`). (tests/json.bats: bb log merges the journal tag bb and kernel messages with the prefix bb:) (tests/json.bats: bb log -f follows and -n sets the number of lines)
+3. [x] **S8.3** `bb log -f` merges the journal tag `bb` and the kernel messages with the prefix `bb:`. The query (`SYSLOG_IDENTIFIER=bb + _TRANSPORT=kernel`, then a filter on the kernel prefix) is tested against a `journalctl` stand-in here, and on a real journal by `tests/matrix/host.sh` in CI (a first version with `-t bb + ...` was rejected by the real `journalctl`). (tests/json.bats: bb log merges the journal tag bb and kernel messages with the prefix bb:) (tests/json.bats: bb log -f follows and -n sets the number of lines)
 
 **Tests:** `tests/json.bats`.
 
