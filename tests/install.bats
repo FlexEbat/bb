@@ -59,7 +59,7 @@ has_bb_objects() { nft list tables 2>/dev/null | grep -q 'inet bb'; }
 	grep -q '^Wants=bb-sets.service' "$BB_UNIT_DIR/bb-firewall.service"
 	grep -q '^Before=.*netfilter-persistent.service.*ufw.service' "$BB_UNIT_DIR/bb-sets.service"
 	grep -q '^After=.*nftables.service.*netfilter-persistent.service.*ufw.service' "$BB_UNIT_DIR/bb-firewall.service"
-	grep -q '^Before=docker.service k3s.service' "$BB_UNIT_DIR/bb-firewall.service"
+	grep -q '^Before=network-pre.target docker.service k3s.service' "$BB_UNIT_DIR/bb-firewall.service"
 	grep -q 'enable bb-sets.service' "$R/sd.log"
 	run iptables -t raw -S PREROUTING; [[ ${lines[1]} == "-A PREROUTING -j BB_FILTER" ]]
 }
@@ -74,7 +74,7 @@ has_bb_objects() { nft list tables 2>/dev/null | grep -q 'inet bb'; }
 		done
 		if [ "$b" = nft ]; then
 			rm "$R/units/bb-sets.service"
-			refute grep -q 'Wants=' "$R/units/bb-firewall.service"
+			refute grep -q 'Wants=bb-sets' "$R/units/bb-firewall.service"
 			refute awk 'prev == "" && $0 == "" && NR > 1 { f = 1 } { prev = $0 } END { exit !f }' "$R/units/bb-firewall.service"
 		else
 			grep -q '^Wants=bb-sets.service' "$R/units/bb-firewall.service"

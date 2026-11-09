@@ -247,6 +247,7 @@ cfg_defaults() {
 
 cfg_valid() { # key value
 	local k=$1 v=$2
+	[[ $v != *\'* ]] || return 1 # the file is KEY='value': a quote would break the line
 	case $k in
 		lang) [[ $v == en || $v == ru ]] ;;
 		backend) [[ -z $v || $v == iptables || $v == nft ]] ;;
@@ -929,8 +930,13 @@ sets_load_all() {
 		manual_family "$f" >"$TMPD/manual.$f"
 		set_replace manual "$f" "$TMPD/manual.$f" || { err err_set_load "manual$f"; rc=1; }
 	done
-	sets_refresh list || rc=1
-	sets_refresh dht || rc=1
+	# The blocklists and the DHT nodes are not critical: when they cannot be loaded (for example a
+	# list that does not fit into the set) the rules still go in, so that the host is protected and
+	# guard can restore it. The failure is reported, never silent.
+	local k
+	for k in list dht; do
+		sets_refresh "$k" || { warn warn_set_degraded "$k"; log_event "list_update_failed name=$k reason=load"; }
+	done
 	flows_restore_if_empty
 	return "$rc"
 }
@@ -1006,9 +1012,12 @@ list_normalize() {
 	} | sort -u >"$out"
 }
 
-# 0 updated, 1 failed, 2 rejected by the safety checks
-list_update_one() {
-	local name=$1 raw ent new prev rc sha ratio=${CFG[min_list_ratio]}
+# A list update has two phases so that the lock is never held during network work:
+# list_fetch_one (download, sha256 check, normalization; no state is touched) and
+# list_commit_one (the safety checks against the stored state, then the cache; under the lock).
+# 0 fetched, 1 failed, 2 rejected by the safety checks
+list_fetch_one() {
+	local name=$1 raw ent rc sha
 	list_read "$name" || { warn warn_list_bad_desc "$name"; return 1; }
 	mk_tmpdir
 	raw=$TMPD/raw.$name ent=$TMPD/ent.$name
@@ -1026,6 +1035,14 @@ list_update_one() {
 		fi
 	fi
 	list_normalize "$raw" "$ent"
+	rm -f -- "$raw"
+	return 0
+}
+
+# 0 updated, 2 rejected by the safety checks
+list_commit_one() {
+	local name=$1 new prev ratio=${CFG[min_list_ratio]}
+	local ent=$TMPD/ent.$name
 	new=$(wc -l <"$ent")
 	prev=$(list_meta_get "$name" count)
 	prev=${prev:-0}
@@ -1035,6 +1052,9 @@ list_update_one() {
 	if ((prev > 0 && new * 100 < prev * ratio)); then
 		warn warn_list_shrunk "$name" "$prev" "$new"; log_event "list_rejected name=$name reason=shrunk"; return 2
 	fi
+	if [[ $FW == ipt ]] && ((new > ${CFG[list_maxelem]})); then
+		warn warn_list_too_many "$name" "$new" "${CFG[list_maxelem]}"; log_event "list_rejected name=$name reason=size"; return 2
+	fi
 	mkdir -p -- "$CACHE_DIR"
 	mv -f -- "$ent" "$CACHE_DIR/$name.list"
 	printf "count='%s'\nupdated='%s'\n" "$new" "$(date +%s)" | write_atomic "$CACHE_DIR/$name.meta"
@@ -1042,6 +1062,8 @@ list_update_one() {
 	log_event "list_updated name=$name entries=$new"
 	return 0
 }
+
+list_update_one() { list_fetch_one "$1" || return $?; list_commit_one "$1"; }
 
 DHT_DEFAULT_NODES='router.bittorrent.com:6881
 router.utorrent.com:6881
@@ -1056,9 +1078,9 @@ dht_seed_nodes() {
 	  printf '%s\n' "$DHT_DEFAULT_NODES"; } | write_atomic "$DHT_NODES_FILE"
 }
 
-# 0 updated, 1 failed, 2 rejected
-dht_update() {
-	local line host port ips ip out new prev ratio=${CFG[min_list_ratio]} strip=0
+# Like the lists: dht_build resolves the names (network, no state touched), dht_commit checks and stores.
+dht_build() {
+	local line host port ips ip out strip=0
 	[[ ${CFG[strip_private]} == yes ]] && strip=1
 	dht_seed_nodes
 	mk_tmpdir
@@ -1087,6 +1109,12 @@ dht_update() {
 		done < <(printf '%s\n' "$ips" | awk -v strip=$strip -v minp4=0 -v minp6=0 -v hosts=0 -f "$AWK_NET")
 	done <"$DHT_NODES_FILE"
 	sort -u -o "$out" "$out"
+	return 0
+}
+
+# 0 updated, 2 rejected
+dht_commit() {
+	local out=$TMPD/dht.new new prev ratio=${CFG[min_list_ratio]}
 	new=$(wc -l <"$out")
 	prev=0
 	[[ -r $DHT_CACHE ]] && prev=$(wc -l <"$DHT_CACHE")
@@ -1103,6 +1131,8 @@ dht_update() {
 	return 0
 }
 
+dht_update() { dht_build && dht_commit; }
+
 # ---------------------------------------------------------------------------
 # 5. Commands
 # ---------------------------------------------------------------------------
@@ -1110,13 +1140,17 @@ ARG_LANG=""
 
 need_root() { [[ $EUID -eq 0 ]] || die err_need_root; }
 
+# take_lock [soft]: with "soft" a busy lock returns 1 instead of ending the command.
 take_lock() {
 	have flock || die err_tools_missing flock
 	mkdir -p -- "$(dirname -- "$LOCK_FILE")"
 	exec 9>"$LOCK_FILE" || die err_write "$LOCK_FILE"
 	local wait=30
 	[[ ${BB_TESTING:-} == 1 ]] && wait=${BB_LOCK_WAIT:-30}
-	flock -w "$wait" 9 || die err_lock
+	if ! flock -w "$wait" 9; then
+		[[ ${1:-} == soft ]] && return 1
+		die err_lock
+	fi
 }
 
 # Load configuration; $1=require -> must be configured (a backend chosen).
@@ -1174,7 +1208,10 @@ cmd_apply() {
 
 # Guard: used by bb-guard.timer. Quiet when everything is in place.
 cmd_guard() {
-	need_root; take_lock; load_config require
+	need_root
+	# A busy lock is not a failure of the guard: it simply runs again at the next interval.
+	take_lock soft || { log_event "guard_skipped reason=lock"; exit 0; }
+	load_config require
 	fw_tools_ok || exit 1
 	mode_check_pending
 	if ! fw_check; then
@@ -1355,8 +1392,11 @@ cmd_mode() {
 		say mode_confirm_hint "$confirm"
 		if [[ -t 0 && -t 1 ]]; then
 			local ans=""
+			flock -u 9 # waiting for the person must not block guard and the other commands
 			printf '%s ' "$(t mode_confirm_prompt)"
-			if read -r -t "$confirm" ans && [[ ${ans,,} == y || ${ans,,} == yes ]]; then
+			read -r -t "$confirm" ans
+			take_lock; load_config require # the state may have changed while the person was thinking
+			if [[ ${ans,,} == y || ${ans,,} == yes ]]; then
 				systemctl stop bb-mode-rollback.timer >/dev/null 2>&1
 				rm -f -- "$PENDING_FILE"
 				say mode_confirmed
@@ -1499,22 +1539,31 @@ cmd_list() {
 			printf "type='%s'\nsource='%s'\nsha256='%s'\n" "$ltype" "$src" "$sha" | write_atomic "$LISTS_D/$name.conf"
 			say list_added "$name" ;;
 		update)
-			need_root; take_lock; load_config
+			need_root; load_config
 			mk_tmpdir
-			local names=() f n rc worst=0 changed=0 dht=0
+			local names=() ok=() f n rc worst=0 changed=0 dht=0 dht_ok=0
 			if [[ -n ${1:-} ]]; then
 				if [[ $1 == dht ]]; then dht=1; else list_name_valid "$1" && [[ -e $LISTS_D/$1.conf ]] || die err_no_list "$1"; names=("$1"); fi
 			else
 				for f in "$LISTS_D"/*.conf; do [[ -e $f ]] && names+=("$(basename -- "$f" .conf)"); done
 				dht=1
 			fi
+			# phase 1, no lock: everything that waits for the network
 			for n in "${names[@]+"${names[@]}"}"; do
-				list_update_one "$n"; rc=$?
+				if list_fetch_one "$n"; then ok+=("$n"); else worst=1; fi
+			done
+			if ((dht)); then
+				if dht_build; then dht_ok=1; else worst=1; fi
+			fi
+			# phase 2, under the lock: safety checks against the stored state, then the sets
+			take_lock; load_config
+			for n in "${ok[@]+"${ok[@]}"}"; do
+				list_commit_one "$n"; rc=$?
 				((rc == 0)) && changed=1 || worst=1
 			done
 			if ((changed)) && [[ -n $FW ]] && fw_live; then sets_refresh list || worst=1; fi
-			if ((dht)); then
-				dht_update; rc=$?
+			if ((dht_ok)); then
+				dht_commit; rc=$?
 				if ((rc == 0)); then [[ -n $FW ]] && fw_live && { sets_refresh dht || worst=1; }; else worst=1; fi
 			fi
 			notify_allow_refresh
@@ -2388,6 +2437,9 @@ doctor_dpi() {
 		doc ok doc_dpi_bin_ok "${ver:-?}"
 	else doc fail doc_dpi_bin_fail "$NDPID_BIN"; fi
 	have jq && doc ok doc_dpi_jq_ok || doc fail doc_dpi_jq_fail
+	if [[ -z ${CFG[iface]} ]]; then doc fail doc_dpi_iface_empty
+	elif have ip && ! ip link show "${CFG[iface]}" >/dev/null 2>&1; then doc fail doc_dpi_iface_missing "${CFG[iface]}"
+	else doc ok doc_dpi_iface_ok "${CFG[iface]}"; fi
 	for u in bb bb-ndpid; do getent passwd "$u" >/dev/null 2>&1 || doc fail doc_dpi_user_fail "$u"; done
 	if have_systemd && have systemctl; then
 		for u in bb-listener.socket bb-ndpid.service; do
@@ -2471,18 +2523,29 @@ def port: type == "number" and . == floor and . >= 1 and . <= 65535;
 # stdin: the nDPId stream. stdout: one JSON document per line. Any protocol violation ends the
 # connection (nDPId reconnects); nothing from the stream is ever executed or interpolated.
 listener_frames() {
-	local hdr payload len max=${CFG[max_event_size]}
-	while IFS= read -r -N 5 hdr; do
-		if [[ ! $hdr =~ ^[0-9]{5}$ ]]; then log_event "listener_frame_error reason=header"; return 1; fi
-		len=$((10#$hdr))
-		if ((len < 1 || len > max)); then log_event "listener_frame_error reason=length"; return 1; fi
-		if ! IFS= read -r -N "$len" payload || ((${#payload} != len)); then
-			log_event "listener_frame_error reason=truncated"; return 1
-		fi
-		payload=${payload//$'\n'/ } # the trailing newline counted in the length
-		printf '%s\n' "$payload"
-	done
-	return 0
+	local rc
+	# One frame is 5 digits and the JSON; the length counts the trailing newline. awk (bytes, under
+	# LC_ALL=C) does the framing: it is much faster than bash and still checks every length.
+	# A frame that spreads over several lines is joined with spaces until the length is reached.
+	awk -v max="${CFG[max_event_size]}" '
+		pend { buf = buf " " $0; got += length($0) + 1 }
+		!pend {
+			if ($0 !~ /^[0-9][0-9][0-9][0-9][0-9]/) exit 3
+			len = substr($0, 1, 5) + 0
+			if (len < 1 || len > max) exit 4
+			buf = substr($0, 6); got = length(buf) + 1
+		}
+		got == len { print buf; fflush(); pend = 0; next }
+		got > len { pend = 0; exit 5 }
+		{ pend = 1 }
+		END { if (pend) exit 5 }'
+	rc=$?
+	case $rc in
+		3) log_event "listener_frame_error reason=header" ;;
+		4) log_event "listener_frame_error reason=length" ;;
+		5) log_event "listener_frame_error reason=truncated" ;;
+	esac
+	((rc == 0))
 }
 
 # One validated candidate "fam sip proto sp dip dp" goes into BATCH unless it is a repeat or
@@ -2974,8 +3037,9 @@ EOF
 [Unit]
 Description=bb: apply blocking rules
 $onfail
-After=nftables.service netfilter-persistent.service iptables.service ip6tables.service ufw.service network-pre.target
-Before=docker.service k3s.service
+After=nftables.service netfilter-persistent.service iptables.service ip6tables.service ufw.service
+Before=network-pre.target docker.service k3s.service
+Wants=network-pre.target
 $wants
 
 [Service]
@@ -3117,6 +3181,7 @@ ProtectHome=yes
 PrivateTmp=yes
 ProtectSystem=strict
 ReadWritePaths=-/var/lib/bb/listener
+MemoryMax=256M
 AmbientCapabilities=CAP_NET_ADMIN
 CapabilityBoundingSet=CAP_NET_ADMIN
 RestrictAddressFamilies=AF_UNIX AF_NETLINK
@@ -3298,6 +3363,7 @@ cmd_install() {
 	[[ -n $pmode ]] || pmode=${CFG[ports_mode]}
 	[[ $pmode == all || -n $ports ]] || ports=${CFG[ports]}
 	cfg_valid iface "$iface" || die err_cfg_invalid iface "$iface"
+	if ((dpi)) && [[ -z $iface ]]; then die err_dpi_no_iface; fi
 	cfg_valid ports_mode "$pmode" || die err_cfg_invalid ports_mode "$pmode"
 	if [[ $pmode != all ]]; then ports_valid "$ports" || die err_cfg_invalid ports "$ports"; else ports=""; fi
 
