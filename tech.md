@@ -504,7 +504,7 @@ The work is split into vertical slices, done in order. A slice is closed when ev
 | S6 | Integrations and diagnostics | partial | 8/9 |
 | S7 | Dynamic layer (nDPId and the listener) | partial | 17/20 |
 | S8 | Machine-readable output and logs | partial | 2/3 |
-| S9 | Test matrix and CI | partial | 1/7 |
+| S9 | Test matrix and CI | partial | 3/7 |
 | S10 | Documentation and release | partial | 3/4 |
 
 ---
@@ -727,12 +727,12 @@ The work is split into vertical slices, done in order. A slice is closed when ev
 
 **Acceptance criteria:**
 
-1. [~] **S9.1** The suite passes on Debian, Ubuntu, and on the RHEL family and Fedora. The `suite` job of `ci.yml` runs it in six containers; it has not run yet (it needs GitHub Actions).
-2. [~] **S9.2** The `iptables` `legacy` variant passes. The `legacy` job runs the suite after switching the alternatives; it has not run yet.
-3. [~] **S9.3** The units start under a real systemd, and a reboot restores the rules. `tests/matrix/host.sh` checks the units and a restart of `bb-firewall` on a CI host; it has not run yet, and a real reboot is not covered.
+1. [x] **S9.1** The suite passes on Debian, Ubuntu, and on the RHEL family and Fedora. The `suite` job of `ci.yml` runs it in six containers (Debian 12 and 13, Ubuntu 24.04, Fedora, Rocky 9, Alma 9); all six passed in the run for commit d8d23a4 (manual). Some tests skip themselves where the environment cannot do what they need (IPv6 in a container, a built nDPId).
+2. [x] **S9.2** The `iptables` `legacy` variant passes. The `legacy` job runs the suite after switching the alternatives; it passed in the run for commit d8d23a4 (manual). On that kernel `ip6tables` has no `raw` table, so `bb` handles IPv4 only there (tests/review.bats: R9: ip6tables without a usable raw table).
+3. [~] **S9.3** The units start under a real systemd, and a reboot restores the rules. `tests/matrix/host.sh` checks the units, `bb doctor` and a restart of `bb-firewall` on a CI host and passed there; a real reboot is not covered.
 4. [ ] **S9.4** SELinux enforcing mode raises no AVC denial for `bb`.
-5. [~] **S9.5** Docker and k3s restarts do not remove the `bb` rules. `tests/matrix/host.sh` restarts them when present; it has not run yet.
-6. [~] **S9.6** IPv6 traffic is blocked on a host with IPv6. `tests/matrix/host.sh` checks the IPv6 sets and that loopback stays reachable; blocking of real IPv6 traffic is covered by the namespace suite, not yet on a CI host.
+5. [~] **S9.5** Docker and k3s restarts do not remove the `bb` rules. `tests/matrix/host.sh` restarts them when present: the Docker restart passed on a CI host; k3s is not installed there, so it is not covered.
+6. [~] **S9.6** IPv6 traffic is blocked on a host with IPv6. `tests/matrix/host.sh` checks the IPv6 sets and that loopback stays reachable, but it skips itself where IPv6 or its `ip6tables` raw table is unusable, which was the case on the CI host; blocking of real IPv6 traffic is covered by the namespace suite where the environment has IPv6.
 7. [x] **S9.7** The `wget` download path works. (tests/cli.bats: without curl the download goes through wget with --https-only)
 
 **Tests:** CI jobs (`tests/matrix/`), `tests/cli.bats`.
