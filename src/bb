@@ -1751,7 +1751,8 @@ send_matrix() { # [txn_id] text  (a retried queue entry reuses its transaction i
 	if (($# >= 2)); then txn=$1 text=$2; else text=$1 txn="bb$(date +%s%N)$RANDOM"; fi
 	have jq || return 127
 	json=$(jq -nc --arg body "${text:0:3900}" '{msgtype: "m.text", body: $body}') || return 1
-	room=$(jq -rn --arg v "${NCFG[matrix_room]}" '$v | @uri') || return 1
+	# jq 1.6 leaves ! * ' ( ) unescaped in @uri and jq 1.7 escapes them: make the result the same
+	room=$(jq -rn --arg v "${NCFG[matrix_room]}" '$v | @uri | gsub("!"; "%21") | gsub("\\*"; "%2A") | gsub("'"'"'"; "%27") | gsub("\\("; "%28") | gsub("\\)"; "%29")') || return 1
 	{
 		printf 'url = "%s/_matrix/client/v3/rooms/%s/send/m.room.message/%s"\n' "${NCFG[matrix_url]%/}" "$room" "$txn"
 		printf 'request = "PUT"\n'

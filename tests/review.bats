@@ -281,3 +281,9 @@ STUB
 	run bb --lang ru doctor
 	[[ $output == *"таблицу raw"* ]]
 }
+
+# R10: the Matrix room id is encoded the same way with every jq version (1.6 does not escape ! * ' ( ))
+@test "R10: the room id encoding does not depend on the jq version" {
+	run bash -c 'room="!a*b'"'"'(c):example.org"; jq -rn --arg v "$room" '"'"'$v | @uri | gsub("!"; "%21") | gsub("\\*"; "%2A") | gsub("'"'"'"'"'"'"'"'"'"; "%27") | gsub("\\("; "%28") | gsub("\\)"; "%29")'"'"''
+	[ "$output" = '%21a%2Ab%27%28c%29%3Aexample.org' ]
+}
