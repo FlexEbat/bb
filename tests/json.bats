@@ -135,7 +135,8 @@ init() { bb __init-config --backend "$1" --ipv6 yes >/dev/null; bb apply >/dev/n
 	[[ $output != *martian* && $output != *sshd* ]]
 	[ "$(wc -l <<<"$output")" -eq 4 ]
 	# one query: tag bb OR kernel, plain text with ISO times, bounded, not following
-	grep -q -- '-t bb + _TRANSPORT=kernel' "$R/jc.args"
+	grep -q -- 'SYSLOG_IDENTIFIER=bb + _TRANSPORT=kernel' "$R/jc.args"
+	refute grep -q -- ' -t ' "$R/jc.args"
 	grep -q -- '-o short-iso' "$R/jc.args"
 	grep -q -- '-n 50' "$R/jc.args"
 	refute grep -q -- ' -f' "$R/jc.args"

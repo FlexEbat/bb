@@ -2574,8 +2574,8 @@ cmd_log() {
 	have journalctl || die err_log_nojournal
 	local args=(-o short-iso --no-pager -n "$n")
 	((follow)) && args+=(-f)
-	# (tag bb) OR (kernel); the awk below keeps only kernel lines that start with the bb: prefix
-	journalctl "${args[@]}" -t bb + _TRANSPORT=kernel |
+	# (tag bb) OR (kernel); both are match terms: "+" is only allowed between terms, not after an option such as -t. The awk below keeps only kernel lines that start with the bb: prefix
+	journalctl "${args[@]}" SYSLOG_IDENTIFIER=bb + _TRANSPORT=kernel |
 		awk '$3 ~ /^bb(\[[0-9]+\])?:$/ || ($3 == "kernel:" && $4 == "bb:") { print; fflush() }'
 	return 0
 }
