@@ -2653,7 +2653,7 @@ listener_line() {
 		fi
 		return 0
 	fi
-	((${#SEEN[@]} >= 100000)) && SEEN=() # bounded memory
+	((${#SEEN[@]} >= SEEN_MAX)) && SEEN=() # bounded memory
 	SEEN[$key]=$((now + $(dur2sec "${CFG[flow_dedup]}s" 2>/dev/null || printf 600)))
 	BATCH+=("$fam $sip $proto $sp $dip $dp")
 }
@@ -2714,6 +2714,8 @@ listener_flush() {
 listener_apply() { # stdin: "fam src dst" lines from jq
 	local line rc last=$SECONDS
 	local -A SEEN=()
+	SEEN_MAX=100000
+	[[ ${BB_TESTING:-} == 1 && ${BB_SEEN_MAX:-} =~ ^[0-9]+$ ]] && SEEN_MAX=$BB_SEEN_MAX # tests only
 	local -a BATCH=()
 	local CUR_MIN=0 MIN_COUNT=0 PAUSE_LOGGED=0
 	while true; do

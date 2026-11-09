@@ -496,13 +496,13 @@ The work is split into vertical slices, done in order. A slice is closed when ev
 
 | Slice | Title | Status | Criteria |
 |---|---|---|---|
-| S1 | Core | partial | 15/17 |
-| S2 | Static lists | partial | 8/9 |
+| S1 | Core | partial | 16/17 |
+| S2 | Static lists | done | 9/9 |
 | S3 | DHT nodes | done | 4/4 |
 | S4 | Installation and operation | partial | 15/16 |
 | S5 | Notifications | partial | 11/12 |
 | S6 | Integrations and diagnostics | partial | 8/9 |
-| S7 | Dynamic layer (nDPId and the listener) | partial | 17/20 |
+| S7 | Dynamic layer (nDPId and the listener) | partial | 18/20 |
 | S8 | Machine-readable output and logs | partial | 2/3 |
 | S9 | Test matrix and CI | partial | 3/7 |
 | S10 | Documentation and release | partial | 3/4 |
@@ -533,7 +533,7 @@ The work is split into vertical slices, done in order. A slice is closed when ev
 14. [x] **S1.14** In the `nft` backend a changed `hook_priority` recreates the base chains. (tests/backend.bats: changed hook_priority recreates the base chains)
 15. [x] **S1.15** No interpreter (Python, Perl, Ruby, Node) is used by the product. (tests/lint.sh: no interpreters)
 16. [~] **S1.16** IPv6 blocking works. The sets and rules are created and loaded, but the traffic test skips itself in an environment without IPv6. (tests/backend.bats: ipv6 ban)
-17. [~] **S1.17** Both `iptables` variants work. Only `nf_tables` has been run; the `legacy` variant is covered by slice 9.
+17. [x] **S1.17** Both `iptables` variants work. `nf_tables` is run by the suite here and in CI; the `legacy` variant passed in the `legacy` job of CI (manual).
 
 **Tests:** `tests/backend.bats` (real traffic between two network namespaces on both backends), `tests/cli.bats`, `tests/lint.sh`.
 
@@ -557,7 +557,7 @@ The work is split into vertical slices, done in order. A slice is closed when ev
 6. [x] **S2.6** An IP from a list is unreachable in `block` mode and reachable in `monitor` mode. (tests/backend.bats: list: monitor passes, block drops, removal restores)
 7. [x] **S2.7** Overlapping and duplicate networks from several lists load on both backends. (tests/backend.bats: list: overlapping and duplicate networks load)
 8. [x] **S2.8** The daily update timer is installed and its ordering is valid. (tests/install.bats: units: syntax and ordering verified by systemd-analyze)
-9. [~] **S2.9** The `wget` download path works. Only the `curl` path is exercised by tests.
+9. [x] **S2.9** The `wget` download path works. (tests/cli.bats: without curl the download goes through wget with --https-only)
 
 **Tests:** `tests/cli.bats`, `tests/backend.bats`.
 
@@ -682,7 +682,7 @@ The work is split into vertical slices, done in order. A slice is closed when ev
 6. [x] **S7.6** Hostile or malformed fields never reach a command. (tests/dpi.bats: hostile or malformed fields never reach a command)
 7. [x] **S7.7** Private, special and allowlisted addresses never enter `flow`, on the source side and on the destination side. (tests/dpi.bats: private, special and allowlisted addresses never enter flow)
 8. [x] **S7.8** Repeated events are deduplicated. (tests/dpi.bats: repeated events are deduplicated)
-9. [~] **S7.9** The deduplication memory is bounded (cleared at 100,000 entries). The cap is in the code but has not been stress-tested.
+9. [x] **S7.9** The deduplication memory is bounded (cleared at 100,000 entries; the tests lower the cap with `BB_SEEN_MAX`). (tests/dpi.bats: nft: the deduplication memory is bounded and cleared when full) (tests/dpi.bats: iptables: the deduplication memory is bounded and cleared when full)
 10. [x] **S7.10** Exceeding the rate limit pauses the listener, and the guard turns its note into a `rate_limit` event; anything but the exact note format is ignored (see D-009). (tests/dpi.bats: exceeding the rate limit pauses the listener and raises rate_limit once)
 11. [x] **S7.11** Flows block by the full tuple, not by host, on both backends. (tests/backend.bats: flow: blocks by full tuple, not by host)
 12. [x] **S7.12** The listener runs as an unprivileged user with `CAP_NET_ADMIN` and nothing else, nDPId runs as its own user, and the socket belongs to that user (see D-008, D-010, D-009). (tests/dpi_install.bats: the listener runs as an unprivileged user with CAP_NET_ADMIN and nothing else) (tests/dpi_install.bats: units: the socket belongs to the nDPId user)

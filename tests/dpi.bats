@@ -276,3 +276,22 @@ t_show() {
 @test "iptables: a flow whose TTL ran out while the host was down is not restored" { t_restore_expired iptables; }
 @test "nft: bb show flows lists the flows, says when there are none, and is localized" { t_show nft; }
 @test "iptables: bb show flows lists the flows, says when there are none, and is localized" { t_show iptables; }
+
+# S7.9: the deduplication memory is bounded: when it is full it is cleared, and an old flow is seen as new again
+t_dedup_bound() {
+	ready "$1"
+	local first evs=() i
+	first=$(ev detected BitTorrent tcp 203.0.113.70 7000 198.51.100.70 6881)
+	evs+=("$first")
+	for i in $(seq 1 10); do evs+=("$(ev detected BitTorrent tcp 203.0.113.70 $((7000 + i)) 198.51.100.70 6881)"); done
+	evs+=("$first")
+	: >"$R/logger.log"
+	BB_SEEN_MAX=10 send "${evs[@]}"
+	grep -q 'flows_added count=12$' "$R/logger.log"          # the first flow came back after the memory was cleared
+	# with the real bound the same events are deduplicated
+	: >"$R/logger.log"
+	send "${evs[@]}"
+	grep -q 'flows_added count=11$' "$R/logger.log"
+}
+@test "nft: the deduplication memory is bounded and cleared when full" { t_dedup_bound nft; }
+@test "iptables: the deduplication memory is bounded and cleared when full" { t_dedup_bound iptables; }
