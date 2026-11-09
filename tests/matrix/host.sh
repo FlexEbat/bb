@@ -53,7 +53,8 @@ if have ip && ip netns add bbhost 2>/dev/null; then
 	if grep -qE ' kernel: bb: ' <<<"$out"; then ok "bb log shows the kernel messages of the LOG rules"; else bad "bb log: no kernel bb: line"; printf '%s\n' "$out" | tail -n 15; fi
 	if grep -qE ' bb(\[[0-9]+\])?: ' <<<"$out"; then ok "bb log shows the events written with the tag bb"; else bad "bb log: no event with the tag bb"; printf '%s\n' "$out" | tail -n 15; fi
 	if grep -vE ' (bb(\[[0-9]+\])?|kernel): ' <<<"$out" | grep -q .; then bad "bb log shows lines that are not bb's"; else ok "bb log shows nothing else"; fi
-	ip netns del bbhost 2>/dev/null; ip link del bbh0 2>/dev/null
+	ip netns del bbhost 2>/dev/null || true # this removes the veth pair as well
+	ip link del bbh0 2>/dev/null || true
 fi
 
 bb uninstall --yes >/dev/null
