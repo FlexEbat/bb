@@ -31,7 +31,7 @@ if systemctl cat k3s.service >/dev/null 2>&1; then
 fi
 
 # S9.6: IPv6 traffic is blocked on a host with IPv6
-if [[ -e /proc/net/if_inet6 ]] && have ip6tables; then
+if [[ -s /proc/net/if_inet6 ]] && have ip6tables && ip6tables -w -t raw -S >/dev/null 2>&1; then
 	ip -6 addr add fd99::1/64 dev lo nodad 2>/dev/null || true
 	bb ban fd99::/64 2>/dev/null || true
 	bb apply

@@ -21,10 +21,10 @@ bb() { "$BB" "$@"; }
 setcfg() { sed -i "s|^$1=.*|$1='$2'|" "$BB_CONF_DIR/bb.conf"; }
 
 reset_fw() {
-	nft flush ruleset 2>/dev/null
-	iptables -t raw -F 2>/dev/null; iptables -t raw -X 2>/dev/null
-	ip6tables -t raw -F 2>/dev/null; ip6tables -t raw -X 2>/dev/null
-	ipset flush 2>/dev/null; ipset destroy 2>/dev/null
+	nft flush ruleset 2>/dev/null || true
+	iptables -t raw -F 2>/dev/null || true; iptables -t raw -X 2>/dev/null || true
+	ip6tables -t raw -F 2>/dev/null || true; ip6tables -t raw -X 2>/dev/null || true # may be unusable (legacy, no module)
+	ipset flush 2>/dev/null || true; ipset destroy 2>/dev/null || true
 	return 0
 }
 

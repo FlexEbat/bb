@@ -45,6 +45,8 @@ MSG[warn_list_shrunk]="list %s shrank sharply (%s -> %s entries); the existing s
 MSG[warn_set_degraded]="could not load the %s set; the rules are applied without it (see the journal)"
 MSG[warn_list_too_many]="list %s has %s entries, more than list_maxelem (%s); keeping the old data"
 MSG[warn_resolve_budget]="name resolution was cut off after %s seconds; names that were not resolved are skipped"
+MSG[warn_ipv6_unusable]="this host has IPv6, but ip6tables cannot use the raw table (is the ip6table_raw module missing?); only IPv4 is handled"
+MSG[doc_ipv6_unusable]="IPv6 is on, but ip6tables cannot use the raw table: IPv6 traffic is not blocked (only IPv4 is)"
 MSG[warn_list_too_big]="list %s exceeds the size limit; the existing set was kept"
 MSG[warn_set_op]="could not update the live set for %s; it will be loaded on the next 'bb apply'"
 

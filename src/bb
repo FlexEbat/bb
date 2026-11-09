@@ -365,7 +365,7 @@ FW=""
 
 fw_families() {
 	printf '4\n'
-	[[ ${CFG[ipv6]} == yes ]] && printf '6\n'
+	ipv6_on && printf '6\n'
 	return 0
 }
 
@@ -412,12 +412,22 @@ detect_backend() {
 	fi
 }
 
+# IPv6 is handled when it is on in the configuration and the backend can use it. A host can have
+# IPv6 while its legacy ip6tables has no raw table (a kernel without the module, a container): then
+# only IPv4 is handled, with a warning (apply, doctor), instead of failing completely.
+IPV6_UNUSABLE=0
+ipv6_on() { [[ ${CFG[ipv6]} == yes && $IPV6_UNUSABLE -eq 0 ]]; }
+
 fw_select() { # sets FW from bb.conf
 	case ${CFG[backend]} in
 		iptables) FW=ipt ;;
 		nft) FW=nft ;;
 		*) die err_not_configured ;;
 	esac
+	IPV6_UNUSABLE=0
+	if [[ $FW == ipt && ${CFG[ipv6]} == yes && $EUID -eq 0 ]] && have ip6tables && ! ip6tables -w -t raw -S >/dev/null 2>&1; then
+		IPV6_UNUSABLE=1
+	fi
 }
 
 fw_missing_list() { # prints the missing tool names, space separated
@@ -1229,6 +1239,7 @@ mode_check_pending() {
 do_apply() {
 	local bdir=$BACKUP_DIR/last-apply
 	fw_tools_ok || return 1
+	((IPV6_UNUSABLE)) && warn warn_ipv6_unusable
 	mk_tmpdir
 	rm -rf -- "$bdir"
 	mkdir -p -- "$bdir"
@@ -1331,7 +1342,7 @@ cmd_ban() {
 	fi
 	file_family "$ALLOW_FILE" "$fam" | grep -qxF -- "$canon" && warn warn_ban_allowed "$canon"
 	entry_file_put "$MANUAL_FILE" "$canon" "$exp" || die err_write "$MANUAL_FILE"
-	if [[ $fam == 6 && ${CFG[ipv6]} != yes ]]; then
+	if [[ $fam == 6 ]] && ! ipv6_on; then
 		: # IPv6 handling is off; the entry is kept in the file only
 	elif fw_live; then
 		set_add manual "$fam" "$canon" "$sec" || warn warn_set_op "$canon"
@@ -2370,6 +2381,7 @@ doctor_backend() {
 	if [[ $FW == ipt ]]; then
 		if ipset list -n >/dev/null 2>&1; then doc ok doc_kernel_ok ipset; else doc fail doc_kernel_fail ipset; fi
 		doc ok doc_variant "$(iptables_variant)"
+		if ((IPV6_UNUSABLE)); then doc warn doc_ipv6_unusable; fi
 	else
 		if nft list tables >/dev/null 2>&1; then doc ok doc_kernel_ok nf_tables; else doc fail doc_kernel_fail nf_tables; fi
 	fi
@@ -2625,7 +2637,7 @@ listener_line() {
 	[[ $proto == "$p2" ]] || return 0
 	sp=$((10#$sp)) dp=$((10#$dp))
 	((sp >= 1 && sp <= 65535 && dp >= 1 && dp <= 65535)) || return 0
-	[[ $fam == 6 && ${CFG[ipv6]} != yes ]] && return 0
+	[[ $fam == 6 ]] && ! ipv6_on && return 0
 	printf -v now '%(%s)T' -1
 	key="$fam $sip $proto $sp $dip $dp"
 	[[ -n ${SEEN[$key]+x} ]] && ((SEEN[$key] > now)) && return 0
@@ -3050,7 +3062,7 @@ allow_autofill() { # prints the entries it added
 		[[ $ip =~ ^127\. || $ip == ::1 ]] && continue
 		canon=$(norm_entry "$ip") || continue
 		fam=${canon%%$'\t'*} canon=${canon#*$'\t'}
-		[[ $fam == 6 && ${CFG[ipv6]} != yes ]] && continue
+		[[ $fam == 6 ]] && ! ipv6_on && continue
 		file_family "$ALLOW_FILE" "$fam" | grep -qxF -- "$canon" && continue
 		entry_file_put "$ALLOW_FILE" "$canon" "" && printf '%s\n' "$canon"
 	done

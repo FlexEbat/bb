@@ -18,4 +18,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Dynamic layer: nDPId build, the listener and `bb show flows`.
 - `bb status --json` and `bb doctor --json`; `bb log [-f] [-n N]` for the journal and kernel messages.
 - Several interfaces for traffic inspection: `--iface eth0,eth1` starts one nDPId process for each.
+- IPv4 keeps being blocked, with a warning, on a host whose `ip6tables` cannot use the `raw` table.
 - English and Russian interface.

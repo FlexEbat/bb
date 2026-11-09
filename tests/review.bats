@@ -257,3 +257,27 @@ STUB
 	left=$(awk '/^  /{ print $NF; exit }' <<<"$output"); left=${left%s}
 	[ -n "$left" ] && [ "$left" -le 600 ] && [ "$left" -gt 0 ]
 }
+
+# R9: a host with IPv6 whose ip6tables cannot use the raw table (seen on a CI kernel with legacy iptables)
+@test "R9: ip6tables without a usable raw table: IPv4 is still blocked, with a warning, and doctor says so" {
+	bb __init-config --backend iptables --ipv6 yes >/dev/null
+	cat >"$R/stubs/ip6tables" <<'STUB'
+#!/bin/sh
+echo "ip6tables v1.8.9 (legacy): can't initialize ip6tables table 'raw': Address family not supported by protocol" >&2
+exit 3
+STUB
+	chmod +x "$R/stubs/ip6tables"
+	run bb apply
+	[ "$status" -eq 0 ]
+	[[ $output == *"cannot use the raw table"* ]]
+	bb status --json | jq -e '.rules == "active"' >/dev/null
+	iptables -t raw -S BB_FILTER | grep -q 'bb_manual4'
+	! ipset list -n | grep -q '6$'
+	run bb ban 198.51.100.40
+	[ "$status" -eq 0 ]
+	ipset test bb_manual4 198.51.100.40
+	run bb doctor --json
+	jq -e '[.checks[] | select(.id == "ipv6_unusable" and .level == "warn")] | length == 1' <<<"$output" >/dev/null
+	run bb --lang ru doctor
+	[[ $output == *"таблицу raw"* ]]
+}

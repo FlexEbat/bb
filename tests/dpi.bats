@@ -52,7 +52,10 @@ t_real_stream() {
 	[ "$status" -eq 0 ]
 	flow_has 4 tcp 203.0.113.10 41000 198.51.100.20 6881        # BitTorrent over TCP / IPv4
 	flow_has 4 udp 203.0.113.10 51000 198.51.100.30 6881        # DHT over UDP
-	flow_has 6 tcp 2001:db8::10 42000 2001:db8:1::20 6881       # BitTorrent over TCP / IPv6
+	# BitTorrent over TCP / IPv6 (not where ip6tables cannot use the raw table: then only IPv4 is handled)
+	if [[ $1 != iptables ]] || ip6tables -w -t raw -S >/dev/null 2>&1; then
+		flow_has 6 tcp 2001:db8::10 42000 2001:db8:1::20 6881
+	fi
 	refute flow_has 4 tcp 203.0.113.10 43000 198.51.100.40 80   # the HTTP flow of the same capture
 }
 
