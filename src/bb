@@ -33,6 +33,7 @@ if [[ ${BB_TESTING:-} == 1 ]]; then
 	SAVED_RULE_FILES=${BB_SAVED_FILES:-}
 	RESOLV_FILES=${BB_RESOLV_FILES:-/etc/resolv.conf}
 	K3S_DIR=${BB_K3S_DIR:-/nonexistent/k3s}
+	K3S_UNIT_FILES=${BB_K3S_UNITS:-}
 	KUBE_MANIFEST_DIR=${BB_KUBE_MANIFEST_DIR:-/nonexistent/manifests}
 	UFW_CONF=${BB_UFW_CONF:-/nonexistent/ufw.conf}
 	FIREWALLD_CONF=${BB_FIREWALLD_CONF:-/nonexistent/firewalld.conf}
@@ -51,6 +52,7 @@ else
 	SAVED_RULE_FILES="/etc/iptables/rules.v4 /etc/iptables/rules.v6 /etc/sysconfig/iptables /etc/sysconfig/ip6tables /etc/sysconfig/ipset /etc/iptables/ipsets"
 	RESOLV_FILES="/etc/resolv.conf /run/systemd/resolve/resolv.conf"
 	K3S_DIR=/etc/rancher/k3s
+	K3S_UNIT_FILES="/etc/systemd/system/k3s.service /etc/systemd/system/k3s-agent.service"
 	KUBE_MANIFEST_DIR=/etc/kubernetes/manifests
 	UFW_CONF=/etc/ufw/ufw.conf
 	FIREWALLD_CONF=/etc/firewalld/firewalld.conf
@@ -1765,8 +1767,9 @@ send_matrix() { # [txn_id] text  (a retried queue entry reuses its transaction i
 
 # ---- message composition (in the notification language) ---------------------------------
 kv_get() { # "k=v k=v" key -> sanitized value (untrusted input never reaches a message raw)
-	local w
-	for w in $1; do
+	local w ws
+	read -r -a ws <<<"$1"
+	for w in "${ws[@]}"; do
 		if [[ $w == "$2="* ]]; then
 			w=${w#*=}
 			w=${w//[^A-Za-z0-9._@:-]/?}
@@ -1832,7 +1835,7 @@ notify_enqueue() {
 	limit=${CFG[notify_rate_limit]}
 	qmax=${CFG[notify_queue_max]}
 	key=$(text_key "$ev|$text")
-	id="$now$RANDOM"
+	id="$now$$$RANDOM"   # pid and RANDOM: unique even for two events in the same second
 	b64=$(printf '%s' "$text" | base64 -w0)
 	mkdir -p -- "$STATE_DIR"
 	(
@@ -1896,7 +1899,7 @@ notify_flush() {
 
 	[[ -r $NOTIFY_QUEUE ]] || return 0
 	local snap
-	snap=$(cat "$NOTIFY_QUEUE")
+	snap=$( (flock 8; cat -- "$NOTIFY_QUEUE" 2>/dev/null) 8>"$NOTIFY_LOCK") || true # under the lock: no half-written last line
 	while IFS=$'\t' read -r id ts pending b64; do
 		[[ -n $id ]] || continue
 		if ((now - ts > ttl)); then done_ids+=("$id"); continue; fi
@@ -2074,11 +2077,12 @@ telegram_detect_chat() { # needs jq; the user has written to the bot
 	local cfg out
 	cfg=$(printf 'url = "https://api.telegram.org/bot%s/getUpdates"\n' "${NCFG[telegram_token]}"; notify_curl_common | grep -v '^output')
 	out=$(printf '%s\n' "$cfg" | curl -K - 2>/dev/null) || return 1
-	jq -r '[.result[]? | (.message // .channel_post // .my_chat_member // empty) | .chat.id] | last // empty' <<<"$out" 2>/dev/null
+	# "<last chat id> <number of distinct chats>"
+	jq -r '[.result[]? | (.message // .channel_post // .my_chat_member // empty) | .chat.id] | if length == 0 then empty else "\(last) \(unique | length)" end' <<<"$out" 2>/dev/null
 }
 
 cmd_notify_setup() {
-	local ch=${1:-} v rc
+	local ch=${1:-} v rc n
 	need_root; take_lock; load_config
 	have curl || die err_tools_missing curl
 	ncfg_load || true
@@ -2093,6 +2097,14 @@ cmd_notify_setup() {
 				[[ -t 0 ]] && read -r _
 				v=$(telegram_detect_chat) || v=""
 				[[ -n $v ]] || die err_notify_chat_detect
+				n=${v#* }; v=${v%% *}
+				# Anyone can write to a bot: never take the detected chat on trust.
+				say notify_setup_chat_found "$v"
+				[[ $n == 1 ]] || warn notify_setup_chat_many "$n"
+				if [[ -t 0 ]]; then
+					read -r -p "$(t notify_setup_chat_confirm) " n || n=""
+					[[ $n == [yYдД]* ]] || die err_notify_chat_declined
+				fi
 			fi
 			ncfg_valid telegram_chat "$v" || die err_notify_bad_value chat
 			NCFG[telegram_chat]=$v ;;
@@ -2242,6 +2254,10 @@ k8s_nets() {
 	if k3s_present; then
 		while IFS= read -r f; do files+=("$f"); done < <(k3s_files)
 		v=$(yaml_values "$key" "${files[@]+"${files[@]}"}")
+		if [[ -n $v ]]; then printf '%s\n' "$v"; found=1; fi
+		# "k3s server --cluster-cidr=..." from the unit (installer INSTALL_K3S_EXEC)
+		# shellcheck disable=SC2086 # the unit file list is a space separated constant
+		v=$(grep -hoE -- "--${key}[= ]['\"]?[0-9a-fA-F:./,]+" $K3S_UNIT_FILES 2>/dev/null | sed -E "s/^--[^= ]+[= ]['\"]?//" | tr ',' '\n')
 		if [[ -n $v ]]; then printf '%s\n' "$v"; found=1; fi
 	fi
 	if kubeadm_present; then

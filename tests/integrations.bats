@@ -164,6 +164,22 @@ YAML
 	refute_in_set internal4 10.42.0.0/16                # explicit settings replace the defaults
 }
 
+@test "k3s flags in the service unit are understood (INSTALL_K3S_EXEC installs)" {
+	mkdir -p "$R/k3s"
+	cat >"$R/k3s.service" <<'UNIT'
+ExecStart=/usr/local/bin/k3s \
+    server \
+    '--cluster-cidr=10.70.0.0/16,fd00:70::/56' \
+    --service-cidr 10.71.0.0/16 \
+UNIT
+	export BB_K3S_UNITS=$R/k3s.service
+	init nft
+	bb integrate k8s >/dev/null
+	for n in 10.70.0.0/16 10.71.0.0/16; do in_set internal4 $n; done
+	in_set internal6 fd00:70::/56
+	refute_in_set internal4 10.42.0.0/16
+}
+
 @test "k3s defaults, kubeadm manifests and manual settings" {
 	init nft
 	mkdir -p "$R/k3s"

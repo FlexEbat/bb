@@ -96,6 +96,15 @@ events() { bb notify events "$1" >/dev/null; }
 	grep -q "^notify_telegram_chat='424242'" "$BB_CONF_DIR/notify.conf"
 }
 
+@test "telegram: the detected chat is shown, and several chats trigger a warning" {
+	printf '{"ok":true,"result":[{"update_id":1,"message":{"chat":{"id":111,"type":"private"}}},{"update_id":2,"message":{"chat":{"id":222,"type":"private"}}}]}' >"$R/updates.json"
+	run bash -c "printf '%s\n\n\n' '$TG_TOKEN' | '$BB' notify setup telegram 2>&1"
+	[ "$status" -eq 0 ]
+	[[ $output == *"222"* ]]
+	[[ $output == *"2 different chats"* ]]
+	grep -q "^notify_telegram_chat='222'" "$BB_CONF_DIR/notify.conf"
+}
+
 @test "matrix: PUT with bearer header, room encoded, JSON built by jq" {
 	run setup_mx
 	[ "$status" -eq 0 ]
@@ -117,6 +126,14 @@ url = "https://attacker.example/x'
 	refute grep -q 'attacker' "$R/curl.cfg"
 	[ "$(grep -c '^data-urlencode = "text=' "$R/curl.cfg")" -eq 3 ]
 	grep -q 'list_update_failed: download of list a?b?c?d failed' "$R/curl.cfg"
+}
+
+@test "event values are never glob-expanded against the working directory" {
+	setup_tg >/dev/null
+	mkdir "$R/cwd" && cd "$R/cwd" && : >'name=leak'
+	bb __notify-event list_update_failed 'name=*'
+	grep -q 'download of list ? failed' "$R/curl.cfg"
+	refute grep -q 'leak' "$R/curl.cfg"
 }
 
 @test "events: only the enabled ones are sent; manual changes never carry the address" {

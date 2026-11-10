@@ -233,6 +233,15 @@ LIST
 	[ ! -e PWNED ]
 }
 
+@test "lists: a supernet that contains a private range is dropped as well" {
+	bb __init-config --backend nft
+	printf '%s\n' 172.0.0.0/8 192.0.0.0/8 100.0.0.0/8 169.0.0.0/8 172.16.0.0/11 fe00::/9 198.51.100.40 8.8.8.0/24 >"$R/l.txt"
+	bb list add t "$R/l.txt"
+	bb list update t
+	run sort "$BB_STATE_DIR/lists/t.list"
+	[ "$output" = $'198.51.100.40\n8.8.8.0/24' ]
+}
+
 @test "lists: strip_private=no keeps private ranges" {
 	bb __init-config --backend nft
 	setcfg strip_private no

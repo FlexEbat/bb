@@ -20,3 +20,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Several interfaces for traffic inspection: `--iface eth0,eth1` starts one nDPId process for each.
 - IPv4 keeps being blocked, with a warning, on a host whose `ip6tables` cannot use the `raw` table.
 - English and Russian interface.
+
+### Fixed
+
+- List sanitizing also drops an entry that *contains* a private or special-purpose range (for example `172.0.0.0/8` or `100.0.0.0/8`), not only entries inside one.
+- Values in notification events are no longer expanded as globs against the working directory.
+- `bb notify setup telegram` shows the detected chat ID, warns when several chats wrote to the bot, and asks for confirmation on a terminal.
+- The notification queue is read under its lock, and queue IDs include the process ID, so two events in the same second cannot share an ID (and a Matrix transaction ID).
+- k3s pod and service ranges are also read from `--cluster-cidr` and `--service-cidr` in the `k3s` service unit.

@@ -44,8 +44,13 @@ function inside4(net, p, rnet, rp) {
 	return (net - net % pow2(32 - rp)) == rnet
 }
 
+# True when the entry lies inside a special-purpose range or contains one:
+# a supernet such as 172.0.0.0/8 would otherwise block 172.16.0.0/12 as well.
 function private4(net, p,   i) {
-	for (i = 1; i <= NR4; i++) if (inside4(net, p, R4N[i], R4P[i])) return 1
+	for (i = 1; i <= NR4; i++) {
+		if (p >= R4P[i]) { if (inside4(net, p, R4N[i], R4P[i])) return 1 }
+		else if ((R4N[i] - R4N[i] % pow2(32 - p)) == net) return 1
+	}
 	return 0
 }
 
@@ -130,12 +135,19 @@ function setup(   i, k, G, n, a) {
 	NR6 = n
 }
 
-function private6(G, p,   i, k, M, ok) {
+function private6(G, p,   i, k, M, T, ok) {
 	for (i = 1; i <= NR6; i++) {
-		if (p < R6P[i]) continue
-		v6mask(G, R6P[i], M)
-		ok = 1
-		for (k = 1; k <= 8; k++) if (M[k] != RG[i, k]) { ok = 0; break }
+		if (p >= R6P[i]) {
+			v6mask(G, R6P[i], M)
+			ok = 1
+			for (k = 1; k <= 8; k++) if (M[k] != RG[i, k]) { ok = 0; break }
+		} else {
+			# the entry is broader than the range: does it contain it?
+			for (k = 1; k <= 8; k++) T[k] = RG[i, k]
+			v6mask(T, p, M)
+			ok = 1
+			for (k = 1; k <= 8; k++) if (M[k] != G[k]) { ok = 0; break }
+		}
 		if (ok) return 1
 	}
 	return 0
