@@ -154,8 +154,8 @@ check() { "$R/repo/tests/check-spec.sh"; }
 	run bash "$REPO/tests/check-release.sh" v1.2.4; [ "$status" -ne 0 ]; [[ $output == *"does not match"* ]]
 	run bash "$REPO/tests/check-release.sh" 1.2.3; [ "$status" -ne 0 ]
 	unset BB_CHANGELOG BB_SOURCE
-	# the real tree is a development version, so a tag for it is refused
-	run bash "$REPO/tests/check-release.sh" v0.1.0; [ "$status" -ne 0 ]
+	# a tag for some other version than the real tree's is refused
+	run bash "$REPO/tests/check-release.sh" v9.9.9; [ "$status" -ne 0 ]
 	# archive and checksums (built from a copy, with the version of the copy)
 	mkdir "$R/tree"; cp -r "$REPO"/src "$REPO"/lang "$REPO"/tests "$REPO"/LICENSE "$REPO"/README.md "$REPO"/Makefile "$R/tree/"
 	cp "$R/cl.md" "$R/tree/CHANGELOG.md"; cp "$R/bb.src" "$R/tree/src/bb"

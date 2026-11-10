@@ -13,7 +13,7 @@ set -uo pipefail
 umask 077
 shopt -s extglob
 
-BB_VERSION="0.1.0-dev"
+BB_VERSION="0.1.0"
 
 # ---------------------------------------------------------------------------
 # 1. Paths, i18n, output

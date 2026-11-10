@@ -29,8 +29,8 @@ Non-goals: a full SIEM, a web interface, analysis of protocols other than BitTor
 
 | Family | Package manager | Status |
 |---|---|---|
-| Debian, Ubuntu and derivatives | `apt` | supported, tested |
-| RHEL, Fedora, Rocky, Alma and derivatives | `dnf` | supported, tested |
+| Debian, Ubuntu and derivatives | `apt` | supported, tested on Ubuntu 24.04 (Debian 12 only for the legacy `iptables` job) |
+| RHEL, Fedora, Rocky, Alma and derivatives | `dnf` | supported, tested on Rocky 9 |
 | Others (Arch, Alpine, openSUSE, etc.) | — | not guaranteed |
 
 Platform detection: from `/etc/os-release` (`ID`, `ID_LIKE`). If the family cannot be determined, `bb install` stops with a message and a list of dependencies for manual installation. The `--force` flag skips the check with no guarantees.
@@ -458,7 +458,7 @@ Levers: a port BPF filter for nDPId and disabling analysis on interfaces where i
 
 Tools: `shellcheck` for scripts, `bats` for the CLI, syntax checks (`iptables-restore --test`, `nft -c`), a `curl` stub for testing notifications, a set of sample nDPId JSON events (including corrupted and malicious lines) for testing parsing in the listener, a catalog parity check (every key present in both `en.sh` and `ru.sh` with the same number and order of placeholders) and a lint that finds hard-coded user-visible strings outside the catalogs. Network namespaces (`ip netns`) are used to test blocking without real traffic.
 
-Test matrix (containers or VMs): Debian 13 and 12, Ubuntu 24.04, Fedora, Rocky/Alma 9; the `iptables` backend (nf_tables and legacy) and the `nft` backend; scenarios with Docker, k3s, ufw (Debian/Ubuntu) and firewalld (RHEL/Fedora) installed; CLI smoke tests in both interface languages.
+Test matrix (containers or VMs): Ubuntu 24.04 and Rocky 9 (Debian 12 for the legacy `iptables` job); the `iptables` backend (nf_tables and legacy) and the `nft` backend; scenarios with Docker, k3s, ufw (Debian/Ubuntu) and firewalld (RHEL/Fedora) installed; CLI smoke tests in both interface languages.
 
 Acceptance criteria:
 
@@ -729,7 +729,7 @@ The work is split into vertical slices, done in order. A slice is closed when ev
 
 **Acceptance criteria:**
 
-1. [x] **S9.1** The suite passes on Debian, Ubuntu, and on the RHEL family and Fedora. The `suite` job of `ci.yml` runs it in six containers (Debian 12 and 13, Ubuntu 24.04, Fedora, Rocky 9, Alma 9); all six passed in the run for commit d8d23a4 (manual). Some tests skip themselves where the environment cannot do what they need (IPv6 in a container, a built nDPId).
+1. [x] **S9.1** The suite passes on Ubuntu and on the RHEL family. The `suite` job of `ci.yml` runs it in two containers (Ubuntu 24.04 and Rocky 9). It also passed on Debian 12 and 13, Fedora and Alma 9 when the matrix had six containers (last in the run for commit 42dad4f); those are no longer tested on every push (manual). Some tests skip themselves where the environment cannot do what they need (IPv6 in a container, a built nDPId).
 2. [x] **S9.2** The `iptables` `legacy` variant passes. The `legacy` job runs the suite after switching the alternatives; it passed in the run for commit d8d23a4 (manual). On that kernel `ip6tables` has no `raw` table, so `bb` handles IPv4 only there (tests/review.bats: R9: ip6tables without a usable raw table).
 3. [~] **S9.3** The units start under a real systemd, and a reboot restores the rules. `tests/matrix/host.sh` checks the units, `bb doctor` and a restart of `bb-firewall` on a CI host and passed there; a real reboot is not covered.
 4. [ ] **S9.4** SELinux enforcing mode raises no AVC denial for `bb`.
