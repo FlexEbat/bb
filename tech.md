@@ -504,7 +504,7 @@ The work is split into vertical slices, done in order. A slice is closed when ev
 | S4 | Installation and operation | done | 16/16 |
 | S5 | Notifications | partial | 11/12 |
 | S6 | Integrations and diagnostics | partial | 8/9 |
-| S7 | Dynamic layer (nDPId and the listener) | partial | 18/20 |
+| S7 | Dynamic layer (nDPId and the listener) | partial | 19/20 |
 | S8 | Machine-readable output and logs | done | 3/3 |
 | S9 | Test matrix and CI | partial | 3/7 |
 | S10 | Documentation and release | partial | 3/4 |
@@ -694,7 +694,7 @@ The work is split into vertical slices, done in order. A slice is closed when ev
 16. [x] **S7.16** `--no-dpi` gives the static mode without units, users or binary; the build packages are recorded; the new units are valid for `systemd-analyze`. (tests/dpi_install.bats: --no-dpi: static mode) (tests/dpi_install.bats: build packages are installed and recorded) (tests/dpi_install.bats: units: syntax and ordering of the dynamic-layer units are valid for systemd-analyze)
 17. [x] **S7.17** `bb uninstall` removes the whole dynamic layer, and a user that was already there stays. (tests/dpi_install.bats: uninstall removes the dynamic layer)
 18. [x] **S7.18** `bb doctor` checks the binary, `jq`, the users, the units and the listener configuration. (tests/dpi_install.bats: bb doctor checks the dynamic layer)
-19. [~] **S7.19** A progress indicator with the percentage is shown while building. The code is there, but output on a terminal is not tested.
+19. [x] **S7.19** A progress indicator with the percentage is shown while building (tests/dpi_install.bats: build progress: spinner and percentage on a terminal, nothing without one (S7.19)).
 20. [~] **S7.20** The socket and the units start under a real systemd. They are only checked with `systemd-analyze` and `socat` as a stand-in for socket activation here; covered by slice 9.
 
 **Tests:** `tests/dpi.bats` (listener, against the stream recorded from the real nDPId), `tests/dpi_install.bats`, `tests/e2e.bats` (live capture), `tests/fixtures/ndpid-1.7.raw`.

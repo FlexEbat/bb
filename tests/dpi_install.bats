@@ -346,3 +346,21 @@ STUB
 		and ([.checks[] | select(.id == "dpi_iface_missing")][0].args == ["nosuch0"])
 		and ([.checks[] | select(.id == "dpi_iface_stopped")][0].args == ["nosuch0"])' <<<"$output" >/dev/null
 }
+
+@test "build progress: spinner and percentage on a terminal, nothing without one (S7.19)" {
+	command -v script >/dev/null || skip "script(1) is not available"
+	local h=$R/progress.sh
+	{
+		echo 'DPI_LOG=$1; : >"$DPI_LOG"; t() { echo Building; }'
+		sed -n '/^run_step() {/,/^}/p' "$BATS_TEST_DIRNAME/../src/bb"
+		echo 'fake() { for p in 10 55 100; do printf "[%3d%%] object\n" "$p"; sleep 0.5; done; }'
+		echo 'run_step "$(t)" fake; echo "rc=$?"'
+	} >"$h"
+	run script -qec "bash $h $R/tty.log" /dev/null
+	[ "$status" -eq 0 ]
+	[[ $output == *"Building"*" 55%"* ]]
+	[[ $output == *" 100%"* ]]
+	[[ $output == *"rc=0"* ]]
+	run bash "$h" "$R/pipe.log"
+	[ "$output" = "rc=0" ]
+}
