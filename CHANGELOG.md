@@ -29,3 +29,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `bb notify setup telegram` shows the detected chat ID, warns when several chats wrote to the bot, and asks for confirmation on a terminal.
 - The notification queue is read under its lock, and queue IDs include the process ID, so two events in the same second cannot share an ID (and a Matrix transaction ID).
 - k3s pod and service ranges are also read from `--cluster-cidr` and `--service-cidr` in the `k3s` service unit.
+- The dynamic-layer listener no longer waits for a full 4 KB block of events when `awk` is `mawk` (the default on Debian and Ubuntu): a detected flow is now added within seconds instead of when nDPId disconnects or enough events pile up.

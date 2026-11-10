@@ -2675,10 +2675,14 @@ def port: type == "number" and . == floor and . >= 1 and . <= 65535;
 # connection (nDPId reconnects); nothing from the stream is ever executed or interpolated.
 listener_frames() {
 	local rc
+	# mawk (the default awk on Debian and Ubuntu) reads a pipe in whole blocks: the listener would only
+	# act once 4 KB of events had piled up, or when nDPId disconnects. -W interactive reads line by line.
+	local -a awkcmd=(awk)
+	awk -W version 2>&1 | grep -qi mawk && awkcmd=(awk -W interactive)
 	# One frame is 5 digits and the JSON; the length counts the trailing newline. awk (bytes, under
 	# LC_ALL=C) does the framing: it is much faster than bash and still checks every length.
 	# A frame that spreads over several lines is joined with spaces until the length is reached.
-	awk -v max="${CFG[max_event_size]}" '
+	"${awkcmd[@]}" -v max="${CFG[max_event_size]}" '
 		pend { buf = buf " " $0; got += length($0) + 1 }
 		!pend {
 			if ($0 !~ /^[0-9][0-9][0-9][0-9][0-9]/) exit 3

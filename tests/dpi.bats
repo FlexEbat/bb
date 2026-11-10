@@ -295,3 +295,15 @@ t_dedup_bound() {
 }
 @test "nft: the deduplication memory is bounded and cleared when full" { t_dedup_bound nft; }
 @test "iptables: the deduplication memory is bounded and cleared when full" { t_dedup_bound iptables; }
+
+@test "listener acts on a live stream while nDPId keeps the connection open (mawk buffers pipes)" {
+	ready nft
+	{ frame "$(ev detected BitTorrent tcp 203.0.113.1 1010 198.51.100.1 6881)"; sleep 14; } | listen >/dev/null 2>&1 3>&- &
+	local i ok=0
+	for i in $(seq 1 24); do
+		if flow_has 4 tcp 203.0.113.1 1010 198.51.100.1 6881; then ok=1; break; fi
+		sleep 0.5
+	done
+	kill "$!" 2>/dev/null || true
+	[ "$ok" -eq 1 ]
+}
