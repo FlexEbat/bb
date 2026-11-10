@@ -57,6 +57,13 @@ MSG[ban_done]="Заблокировано: %s"
 MSG[unban_done]="Блокировка снята: %s"
 MSG[allow_done]="Добавлено в исключения: %s"
 MSG[allow_removed]="Удалено из исключений: %s"
+MSG[ban_list_perm]="бессрочно"
+MSG[ban_list_ttl]="истекает через %s"
+MSG[ban_list_none]="Ручных блокировок нет."
+MSG[allow_src_manual]="вручную"
+MSG[allow_src_notify]="уведомления"
+MSG[allow_src_integration]="интеграции"
+MSG[allow_list_none]="Список исключений пуст."
 
 MSG[mode_current]="Текущий режим: %s"
 MSG[mode_changed]="Режим изменён на %s."
@@ -97,7 +104,9 @@ MSG[help_main]="bb - лёгкий блокировщик BitTorrent, DHT и чё
   status                      бэкенд, режим, размеры наборов, счётчики
   mode monitor|block          сменить режим (block --confirm N откатится без подтверждения)
   ban IP|СЕТЬ [--ttl 7d]      ручная блокировка   unban IP|СЕТЬ   снять блокировку
+  ban list                    показать ручные блокировки
   allow IP|СЕТЬ [--rm]        никогда не блокировать этот адрес
+  allow list                  показать список исключений
   list [add|update|rm]        внешние чёрные списки и DHT-узлы
   notify setup|test|status    уведомления в Telegram / Matrix
   integrate [auto|docker|...] Docker, k3s/k8s, ufw, firewalld   doctor   диагностика
@@ -120,15 +129,15 @@ MSG[help_mode]="Использование: bb mode [monitor|block|confirm] [--c
 
 monitor пишет в журнал и считает, но не отбрасывает; block отбрасывает. С --confirm режим
 вернётся в monitor, если вы не выполните «bb mode confirm» вовремя (по умолчанию 60 с)."
-MSG[help_ban]="Использование: bb ban IP|СЕТЬ [--ttl СРОК]
+MSG[help_ban]="Использование: bb ban IP|СЕТЬ [--ttl СРОК] | bb ban list
 
-Блокирует адрес или сеть. СРОК: 90s, 30m, 12h, 7d, 2w. Без --ttl блокировка бессрочная."
+Блокирует адрес или сеть. СРОК: 90s, 30m, 12h, 7d, 2w. Без --ttl блокировка бессрочная. 'list' показывает ручные блокировки и оставшееся время."
 MSG[help_unban]="Использование: bb unban IP|СЕТЬ
 
 Снимает ручную блокировку."
-MSG[help_allow]="Использование: bb allow IP|СЕТЬ [--rm]
+MSG[help_allow]="Использование: bb allow IP|СЕТЬ [--rm] | bb allow list
 
-Исключает адрес или сеть из блокировки. --rm убирает исключение."
+Исключает адрес или сеть из блокировки. --rm убирает исключение. 'list' показывает все исключения и их источник."
 MSG[help_lang]="Использование: bb lang [en|ru]
 
 Показывает или меняет язык интерфейса."

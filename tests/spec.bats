@@ -97,7 +97,7 @@ check() { "$R/repo/tests/check-spec.sh"; }
 	run check
 	[[ $output == *"D-002 is active but the spec text never says"* ]]
 	mk_repo
-	sed -i '/^| D-004 |/ s/ (tests\/cli.bats:[^)]*)//; /^| D-004 |/ s/ (tests\/integrations.bats:[^)]*)//; /^| D-004 |/ s/ (tests\/install.bats:[^)]*)//; /^| D-004 |/ s/ (tests\/json.bats:[^)]*)//' "$R/repo/tech.md"
+	sed -i '/^| D-004 |/ s/ (tests\/cli.bats:[^)]*)//g; /^| D-004 |/ s/ (tests\/integrations.bats:[^)]*)//; /^| D-004 |/ s/ (tests\/install.bats:[^)]*)//; /^| D-004 |/ s/ (tests\/json.bats:[^)]*)//' "$R/repo/tech.md"
 	run check
 	[[ $output == *"D-004 is active but cites no test"* ]]
 	mk_repo

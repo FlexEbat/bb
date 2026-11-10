@@ -20,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Several interfaces for traffic inspection: `--iface eth0,eth1` starts one nDPId process for each.
 - IPv4 keeps being blocked, with a warning, on a host whose `ip6tables` cannot use the `raw` table.
 - English and Russian interface.
+- `bb ban list` shows the manual bans with the time left; `bb allow list` shows the allowlist with the source of each entry.
 
 ### Fixed
 

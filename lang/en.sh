@@ -58,6 +58,13 @@ MSG[ban_done]="Banned: %s"
 MSG[unban_done]="Unbanned: %s"
 MSG[allow_done]="Allowed: %s"
 MSG[allow_removed]="Removed from the allowlist: %s"
+MSG[ban_list_perm]="permanent"
+MSG[ban_list_ttl]="expires in %s"
+MSG[ban_list_none]="No manual bans."
+MSG[allow_src_manual]="manual"
+MSG[allow_src_notify]="notifications"
+MSG[allow_src_integration]="integrations"
+MSG[allow_list_none]="The allowlist is empty."
 
 MSG[mode_current]="Current mode: %s"
 MSG[mode_changed]="Mode changed to %s."
@@ -98,7 +105,9 @@ Usage: bb COMMAND [options]       (add --help to any command)
   status                      backend, mode, set sizes, counters
   mode monitor|block          switch mode (block --confirm N reverts if not confirmed)
   ban IP|NET [--ttl 7d]       manual ban        unban IP|NET   remove a ban
+  ban list                    show the manual bans
   allow IP|NET [--rm]         never block this address
+  allow list                  show the allowlist
   list [add|update|rm]        external blocklists and DHT nodes
   notify setup|test|status    Telegram / Matrix notifications
   integrate [auto|docker|...] Docker, k3s/k8s, ufw, firewalld   doctor   diagnostics
@@ -121,15 +130,15 @@ MSG[help_mode]="Usage: bb mode [monitor|block|confirm] [--confirm [SECONDS]]
 
 monitor logs and counts without dropping; block drops. With --confirm the mode
 reverts to monitor unless you run 'bb mode confirm' in time (default 60 s)."
-MSG[help_ban]="Usage: bb ban IP|NET [--ttl DURATION]
+MSG[help_ban]="Usage: bb ban IP|NET [--ttl DURATION] | bb ban list
 
-Blocks an address or network. DURATION: 90s, 30m, 12h, 7d, 2w. Without --ttl the ban is permanent."
+Blocks an address or network. DURATION: 90s, 30m, 12h, 7d, 2w. Without --ttl the ban is permanent. 'list' shows the manual bans and the time left."
 MSG[help_unban]="Usage: bb unban IP|NET
 
 Removes a manual ban."
-MSG[help_allow]="Usage: bb allow IP|NET [--rm]
+MSG[help_allow]="Usage: bb allow IP|NET [--rm] | bb allow list
 
-Exempts an address or network from blocking. --rm removes the exemption."
+Exempts an address or network from blocking. --rm removes the exemption. 'list' shows every allowed entry and where it comes from."
 MSG[help_lang]="Usage: bb lang [en|ru]
 
 Shows or changes the interface language."

@@ -24,6 +24,45 @@ teardown() { teardown_root; }
 	[ ! -s "$BB_CONF_DIR/manual.list" ]
 }
 
+@test "ban list: permanent and timed bans, expired ones are left out" {
+	bb __init-config --backend nft
+	run bb ban list
+	[ "$status" -eq 0 ]; [[ $output == "No manual bans." ]]
+	bb ban 198.51.100.9
+	bb ban 203.0.113.0/24 --ttl 2d
+	bb ban 2001:db8::7 --ttl 30m
+	printf '192.0.2.99 %s\n' "$(($(date +%s) - 10))" >>"$BB_CONF_DIR/manual.list"   # expired
+	run bb ban list
+	[ "$status" -eq 0 ]
+	[ "${#lines[@]}" -eq 3 ]
+	[[ $output == *$'198.51.100.9\tpermanent'* ]]
+	[[ $output == *$'203.0.113.0/24\texpires in 1d 23h'* || $output == *$'203.0.113.0/24\texpires in 2d 0h'* ]]
+	[[ $output == *$'2001:db8::7\texpires in 29m'* || $output == *$'2001:db8::7\texpires in 30m'* ]]
+	[[ $output != *192.0.2.99* ]]
+	run bb ban list extra
+	[ "$status" -ne 0 ]
+}
+
+@test "allow list: manual entries and the generated ones with their source" {
+	bb __init-config --backend nft
+	run bb allow list
+	[ "$status" -eq 0 ]; [[ $output == "The allowlist is empty." ]]
+	bb allow 192.168.1.0/24
+	bb allow 2001:db8:1::/48
+	mkdir -p "$BB_STATE_DIR"
+	printf '10.9.8.7\n' >"$BB_STATE_DIR/integrations.allow"
+	printf '149.154.167.99\n' >"$BB_STATE_DIR/notify.allow"
+	run bb allow list
+	[ "$status" -eq 0 ]
+	[ "${#lines[@]}" -eq 4 ]
+	[[ $output == *$'192.168.1.0/24\tmanual'* ]]
+	[[ $output == *$'2001:db8:1::/48\tmanual'* ]]
+	[[ $output == *$'149.154.167.99\tnotifications'* ]]
+	[[ $output == *$'10.9.8.7\tintegrations'* ]]
+	run bb allow list extra
+	[ "$status" -ne 0 ]
+}
+
 @test "ban/unban/allow edit the source files; ban is idempotent" {
 	bb __init-config --backend nft
 	bb ban 198.51.100.9

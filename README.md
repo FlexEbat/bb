@@ -63,7 +63,8 @@ bb status                     bb doctor                     bb show flows
 bb apply                      bb guard
 bb lang [en|ru]               show or change the interface language
 bb list [add|update|rm]       bb ban <ip|net> [--ttl 7d]    bb unban <ip|net>
-bb allow <ip|net> [--rm]      bb integrate auto|docker|k8s|ufw|firewalld|none|status
+bb ban list                   bb allow <ip|net> [--rm]      bb allow list
+bb integrate auto|docker|k8s|ufw|firewalld|none|status
 bb notify setup telegram|matrix | test | status | enable | disable | events
 bb mode monitor|block [--confirm SECONDS]
 bb uninstall [--yes] [--keep-packages]

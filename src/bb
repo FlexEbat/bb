@@ -1325,8 +1325,58 @@ entry_file_del() { # file entry -> 0 if it was present
 	awk -v e="$e" '$1 != e' "$file" | write_atomic "$file"
 }
 
+fmt_secs() { # seconds -> "2d 3h", "5h 10m", "7m", "40s"
+	local s=$1 d h m
+	d=$((s / 86400)) h=$((s % 86400 / 3600)) m=$((s % 3600 / 60))
+	if ((d > 0)); then printf '%sd %sh' "$d" "$h"
+	elif ((h > 0)); then printf '%sh %sm' "$h" "$m"
+	elif ((m > 0)); then printf '%sm' "$m"
+	else printf '%ss' "$s"; fi
+}
+
+ban_list() { # bb ban list: unexpired manual bans, "entry<TAB>permanent|expires in ..."
+	load_config
+	local e left any=0
+	while read -r e left; do
+		[[ -n $e ]] || continue
+		printf '%s\t' "$e"
+		if [[ -n $left ]]; then say ban_list_ttl "$(fmt_secs "$left")"; else say ban_list_perm; fi
+		any=1
+	done < <({ manual_family 4; manual_family 6; } | sort -k1,1)
+	((any)) || say ban_list_none
+}
+
+allow_list() { # bb allow list: manual entries plus the ones generated for notifications and integrations
+	load_config
+	local f e src any=0
+	for src in manual notify integration; do
+		case $src in
+			manual) f=$ALLOW_FILE ;;
+			notify) f=$NOTIFY_ALLOW_FILE ;;
+			*) f=$INTEG_ALLOW ;;
+		esac
+		[[ -r $f ]] || continue
+		while read -r e _; do
+			[[ -n $e ]] || continue
+			printf '%s\t' "$e"
+			case $src in
+				manual) say allow_src_manual ;;
+				notify) say allow_src_notify ;;
+				*) say allow_src_integration ;;
+			esac
+			any=1
+		done < <(sort -u -- "$f")
+	done
+	((any)) || say allow_list_none
+}
+
 cmd_ban() {
 	local entry="" ttl="" sec="" exp=0 line fam canon
+	if [[ ${1:-} == list ]]; then
+		[[ $# -eq 1 ]] || die err_usage ban
+		ban_list
+		return 0
+	fi
 	while (($#)); do
 		case $1 in
 			--ttl) (($# >= 2)) || die err_usage ban; ttl=$2; shift 2 ;;
@@ -1369,6 +1419,11 @@ cmd_unban() {
 
 cmd_allow() {
 	local entry="" rm=0 line fam canon
+	if [[ ${1:-} == list ]]; then
+		[[ $# -eq 1 ]] || die err_usage allow
+		allow_list
+		return 0
+	fi
 	while (($#)); do
 		case $1 in
 			--rm) rm=1; shift ;;
