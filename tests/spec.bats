@@ -36,7 +36,10 @@ check() { "$R/repo/tests/check-spec.sh"; }
 	[ "$(sed -n 1p "$REPO/tech.md")" = '# bb — a lightweight CLI blocker for BitTorrent, DHT and blocklists' ]
 	grep -qE '^\*\*Version: v[0-9]+\*\*' "$REPO/tech.md"
 	grep -q '^\*\*Status: under development' "$REPO/tech.md"
-	refute grep -qP '[\x{0400}-\x{04FF}]' "$REPO/tech.md"          # no Cyrillic anywhere
+	# no Cyrillic anywhere: UTF-8 bytes D0..D3 + continuation, checked bytewise so that the result does not
+	# depend on the locale (a \x{0400} range is an error under LC_ALL=C and then proves nothing)
+	printf 'Язык' | LC_ALL=C grep -qP '[\xD0-\xD3][\x80-\xBF]'        # the pattern does find Cyrillic
+	refute env LC_ALL=C grep -qP '[\xD0-\xD3][\x80-\xBF]' "$REPO/tech.md"
 }
 
 @test "check-spec: a [x] criterion that cites no test is rejected" {
