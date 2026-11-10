@@ -507,7 +507,7 @@ The work is split into vertical slices, done in order. A slice is closed when ev
 | S7 | Dynamic layer (nDPId and the listener) | partial | 19/20 |
 | S8 | Machine-readable output and logs | done | 3/3 |
 | S9 | Test matrix and CI | partial | 3/7 |
-| S10 | Documentation and release | partial | 3/4 |
+| S10 | Documentation and release | done | 4/4 |
 
 ---
 
@@ -754,7 +754,7 @@ The work is split into vertical slices, done in order. A slice is closed when ev
 1. [x] **S10.1** The README states `Status: under development`, names the license, and does not point to this file. (tests/spec.bats: README)
 2. [x] **S10.2** The repository carries the MIT license. (tests/spec.bats: license)
 3. [x] **S10.3** `CHANGELOG.md` follows Keep a Changelog. (tests/spec.bats: CHANGELOG.md follows Keep a Changelog)
-4. [~] **S10.4** A tag produces a release with checksums, and the version in the CHANGELOG and in the tag agree. The check and the archive with `SHA256SUMS` are tested; the publishing step of `release.yml` has not run yet. (tests/spec.bats: release check: the tag, BB_VERSION and the CHANGELOG must agree)
+4. [x] **S10.4** A tag produces a release with checksums, and the version in the CHANGELOG and in the tag agree. The check and the archive with `SHA256SUMS` are tested; `release.yml` ran for `v0.1.0` (published with `bb-0.1.0.tar.gz` and `SHA256SUMS`, the checksum verified after downloading) (manual). (tests/spec.bats: release check: the tag, BB_VERSION and the CHANGELOG must agree)
 
 **Tests:** `tests/spec.bats`.
 
